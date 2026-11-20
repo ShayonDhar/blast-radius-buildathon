@@ -50,7 +50,7 @@ def _install_usage_hooks():
     from sqlglot.parser import Parser
     from sqlglot.tokens import Tokenizer
 
-    for base in (D.Dialect, Parser, Generator, Tokenizer):
+    for base in ():
         orig = base.__init__
 
         def make(orig):
