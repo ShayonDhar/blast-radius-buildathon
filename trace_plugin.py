@@ -20,15 +20,26 @@ _opens = {}
 _used = {}  # ctx -> set of source files whose classes were instantiated/looked up
 
 
+_cls_files = {}
+
+
 def _note(cls):
     if _ctx is None:
         return
-    mods = _used.setdefault(_ctx, set())
-    for k in getattr(cls, "__mro__", ()):
-        m = sys.modules.get(getattr(k, "__module__", ""))
-        f = getattr(m, "__file__", None)
-        if f and f.startswith(_ROOT):
-            mods.add(os.path.relpath(f, _ROOT))
+    files = _cls_files.get(cls)
+    if files is None:
+        files = set()
+        for k in getattr(cls, "__mro__", ()):
+            m = sys.modules.get(getattr(k, "__module__", ""))
+            f = getattr(m, "__file__", None)
+            if f and f.startswith(_ROOT):
+                files.add(os.path.relpath(f, _ROOT))
+        files = _cls_files[cls] = frozenset(files)
+    mods = _used.get(_ctx)
+    if mods is None:
+        mods = _used[_ctx] = set()
+    if not files <= mods:
+        mods |= files
 
 
 def _install_usage_hooks():
