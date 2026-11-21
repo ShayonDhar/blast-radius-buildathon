@@ -433,17 +433,27 @@ def main():
         tests = json.load(fh)["tests"]
     num = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
-    mp = Map(MAP)
-    number_of = [num.get(t) for t in mp.tests]
-    known = set(mp.tests)
+    try:
+        mp = Map(MAP)
+        number_of = [num.get(t) for t in mp.tests]
+        known = set(mp.tests)
+    except Exception as e:  # unreadable map: run everything rather than nothing
+        print(f"map unreadable: {e!r}", file=sys.stderr)
+        mp, number_of, known = None, [t["number"] for t in tests], {t["id"] for t in tests}
+        mp = _AllMap(len(tests))
     unknown = [t["number"] for t in tests if t["id"] not in known]
     cdir = os.path.join(DATA, "commits")
     for name in sorted(n for n in os.listdir(cdir) if n.endswith(".patch")):
         stem = name[:-6]
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as fh:
-                files = parse_patch(fh.read())
-            m, wide = select(mp, files, None)
+                text = fh.read()
+            files = parse_patch(text)
+            if text.strip() and not any(f["hunks"] or f["new_file"] or f["deleted"] or f["old"] != f["new"]
+                                        or f["binary"] for f in files):
+                m, wide = mp.all_mask(), 0  # a patch we could not read any change from
+            else:
+                m, wide = select(mp, files, None)
         except Exception as e:  # never crash: fall back to everything
             print(f"{stem}: {e!r}", file=sys.stderr)
             m, wide = mp.all_mask(), 0
@@ -453,6 +463,19 @@ def main():
         filler = [number_of[i] for i in bits(wide & ~m) if number_of[i] is not None]
         workers = plan([(n, ms[n]) for n in chosen], [(n, ms[n]) for n in filler])
         print(json.dumps({"commit": stem, "workers": workers}))
+
+
+class _AllMap:
+    """Stand-in used when the map cannot be read: every change selects every test."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def all_mask(self):
+        return (1 << self._n) - 1
+
+    def __getattr__(self, name):
+        raise RuntimeError("no map")
 
 
 if __name__ == "__main__":
