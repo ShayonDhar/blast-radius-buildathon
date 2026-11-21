@@ -9,6 +9,7 @@ import gzip
 import json
 import os
 import sys
+import time
 
 DATA = os.environ.get("BR_DATA", "/data")
 APP = os.path.dirname(os.path.abspath(__file__))
@@ -594,10 +595,129 @@ def bits(m):
     return
 
 
+# ---- runtime verification -------------------------------------------------------------------
+# Run (part of) the static selection against the patched source and keep only what fails.
+VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+GATE = os.environ.get("BR_GATE", "1") == "1"
+SMALL_MS = int(os.environ.get("BR_SMALL_MS", "1500"))   # verify a whole selection up to this cost
+SMALL_N = 40
+GATE_MS = int(os.environ.get("BR_GATE_MS", "4000"))     # budget for the cheap part when a giant is present
+SENT_MS = int(os.environ.get("BR_SENT_MS", "0"))        # sentinel budget when the cheap part is too big
+GATED = {"tests/test_executor.py::TestExecutor::test_execute_tpcds"}
+GATED_FILE = "tests/test_executor.py"
+HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # expensive per-run setup
+WALL_BUDGET = float(os.environ.get("BR_WALL", "90"))
+_T0 = time.monotonic()
+_verifier = None
+
+
+def _get_verifier():
+    global _verifier, VERIFY
+    if _verifier is None:
+        try:
+            sys.path.insert(0, APP)
+            from verify import Verifier
+
+            v = Verifier(SRC, timeout_s=30)
+            v.start()
+        except Exception:
+            VERIFY = False  # no test environment in this image: static answers only
+            raise
+        _verifier = v
+    return _verifier
+
+
+def _patched_files(files):
+    """{rel: new text} for a patch we can reproduce exactly; None when we cannot."""
+    out = {}
+    for f in files:
+        rel, old = f["new"], f["old"]
+        if f["deleted"] or f["binary"] or rel != old or not (rel.startswith("sqlglot/") or rel.startswith("tests/")):
+            return None
+        base = os.path.join(SRC, old)
+        if f["new_file"]:
+            if os.path.exists(base):
+                return None
+            text = ""
+        else:
+            if not os.path.exists(base):
+                return None
+            with open(base, encoding="utf-8") as fh:
+                text = fh.read()
+        out[rel] = apply_patch(text, f)
+    return out
+
+
+def _expand(entries, ids):
+    out = set()
+    for e in entries:
+        for n in ids:
+            k = ids[n]
+            if k == e or k.startswith(e + "::") or k.startswith(e + "["):
+                out.add(n)
+    return out
+
+
+def verify_commit(stem, files, chosen, ms, idof):
+    """Return a refined list of test numbers, or None to keep the static selection."""
+    if time.monotonic() - _T0 > WALL_BUDGET:
+        return None
+    giants = [n for n in chosen if idof.get(n) in GATED] if GATE else []
+    rest = [n for n in chosen if n not in giants]
+    cost = sum(ms[n] for n in rest)
+    sentinel = False
+    if giants:
+        if not rest:
+            return None
+        stop_first = True
+        if cost > GATE_MS:
+            if SENT_MS <= 0:
+                return None
+            # too much to run: run the cheapest part; if it all passes, drop only the giant
+            sentinel, acc, part = True, 0, []
+            for n in sorted((n for n in rest if not idof[n].startswith(HEAVY)), key=lambda n: ms[n]):
+                if acc + ms[n] > SENT_MS:
+                    break
+                part.append(n)
+                acc += ms[n]
+            # the giant's own test file exercises the same code path: its cheap tests always run
+            same = [n for n in rest if idof[n].startswith(GATED_FILE) and ms[n] < 2000]
+            if not same:
+                return None
+            part += same
+            acc += sum(ms[n] for n in same)
+            done = set(part)
+            keep, rest, cost = [n for n in rest if n not in done], part, acc
+    else:
+        if cost > SMALL_MS or len(rest) > SMALL_N or any(idof[n].startswith(HEAVY) for n in rest):
+            return None
+        stop_first = False
+    pf = _patched_files(files)
+    if pf is None:
+        return None
+    run = sorted(rest, key=lambda n: (idof[n].startswith(HEAVY), ms[n]))
+    failing, ok, _cpu = _get_verifier().run(pf, [idof[n] for n in run], expected_seconds=cost / 1000,
+                                           stop_first=stop_first)
+    if os.environ.get("BR_DEBUG"):
+        print(f"{stem}: verify n={len(run)} rec={cost}ms cpu={_cpu:.2f} ok={ok} failing={len(failing)}", file=sys.stderr)
+    if not ok:
+        return None
+    sub = {n: idof[n] for n in run}
+    bad = _expand(failing, sub)
+    if failing and not bad:  # a failure we cannot attribute (collection error elsewhere)
+        return None
+    if giants:
+        if bad:
+            return None
+        return sorted(keep) if sentinel else []
+    return sorted(bad)
+
+
 def main():
     with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as fh:
         tests = json.load(fh)["tests"]
     num = {t["id"]: t["number"] for t in tests}
+    idof = {t["number"]: t["id"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     try:
         mp = Map(MAP)
@@ -629,8 +749,16 @@ def main():
         if m and unknown:
             chosen += unknown
         filler = [number_of[i] for i in bits(wide & ~m) if number_of[i] is not None]
+        if VERIFY and chosen:
+            try:
+                out = verify_commit(stem, files, chosen, ms, idof)
+            except Exception as e:  # any verifier problem: keep the static answer
+                print(f"{stem}: verify {e!r}", file=sys.stderr)
+                out = None
+            if out is not None:
+                chosen, filler = out, []
         workers = plan([(n, ms[n]) for n in chosen], [(n, ms[n]) for n in filler])
-        print(json.dumps({"commit": stem, "workers": workers}))
+        print(json.dumps({"commit": stem, "workers": workers}), flush=True)
 
 
 class _AllMap:
