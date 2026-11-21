@@ -6,24 +6,30 @@ tests that executed any line of it; for every data file, the tests that opened i
 """
 
 import gzip
-import io
 import json
 import os
-import re
 import sys
-import tokenize
-from pathlib import Path
 
-DATA = Path(os.environ.get("BR_DATA", "/data"))
-APP = Path(__file__).resolve().parent
-MAP = Path(os.environ.get("BR_MAP", APP / "maps.json.gz"))
-SRC = Path(os.environ.get("BR_SRC", APP / "src"))
+DATA = os.environ.get("BR_DATA", "/data")
+APP = os.path.dirname(os.path.abspath(__file__))
+MAP = os.environ.get("BR_MAP", os.path.join(APP, "maps.json.gz"))
+SRC = os.environ.get("BR_SRC", os.path.join(APP, "src"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
 ALWAYS_ALL = {"pyproject.toml", "setup.cfg", "setup.py", "tox.ini", "pytest.ini", "conftest.py",
               "tests/conftest.py", "requirements.txt"}
-HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_hunk_header(raw):
+    """'@@ -a,b +c,d @@ ...' -> old start line, or None."""
+    if not raw.startswith("@@ -"):
+        return None
+    head = raw[4:].split(" ", 1)[0]
+    try:
+        return int(head.split(",")[0])
+    except ValueError:
+        return None
 
 
 def parse_patch(text):
@@ -60,9 +66,9 @@ def parse_patch(text):
         elif raw.startswith("Binary files") or raw.startswith("GIT binary patch"):
             cur["binary"] = True
         else:
-            m = HUNK.match(raw)
-            if m:
-                hunk = (int(m.group(1)), [])
+            start = parse_hunk_header(raw)
+            if start is not None:
+                hunk = (start, [])
                 cur["hunks"].append(hunk)
             elif hunk is not None and raw[:1] in (" ", "-", "+"):
                 hunk[1].append((raw[0], raw[1:]))
@@ -140,6 +146,9 @@ def apply_patch(old_text, f):
 
 
 def code_tokens(text):
+    import io
+    import tokenize
+
     toks = []
     for t in tokenize.generate_tokens(io.StringIO(text).readline):
         if t.type in (tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER):
@@ -288,14 +297,17 @@ def py_file_mask(mp, rel, f, source_old):
             new_text = None
         if new_text is not None:
             try:
-                compile(new_text, rel, "exec")
+                # Parse only, unless a keyword that fails at compile time (not parse time) is touched.
+                touched = " ".join(c for _, ls in f["hunks"] for t, c in ls if t != " ")
+                full = any(k in touched for k in ("return", "yield", "await", "break", "continue", "nonlocal", "global"))
+                compile(new_text, rel, "exec", 0 if full else 0x400)
             except Exception:
                 return import_breaking_mask(mp, rel)  # does not even compile
             try:
-                cookie = re.compile(r"coding[:=]")
                 head_old = "".join(source_old.splitlines(keepends=True)[:2])
                 head_new = "".join(new_text.splitlines(keepends=True)[:2])
-                if head_old == head_new or not (cookie.search(head_old) or cookie.search(head_new)):
+                if head_old == head_new or not ("coding:" in head_old or "coding=" in head_old
+                                                or "coding:" in head_new or "coding=" in head_new):
                     pass
                 else:
                     raise ValueError("encoding declaration changed")
@@ -350,8 +362,11 @@ def select(mp, files, extras):
             return mp.all_mask(), wide
         if rel.endswith(".py") and (old in mp.files or rel in mp.files):
             key = old if old in mp.files else rel
-            src = SRC / old
-            source_old = src.read_text() if src.exists() else None
+            src = os.path.join(SRC, old)
+            source_old = None
+            if os.path.exists(src):
+                with open(src, encoding="utf-8", errors="replace") as fh:
+                    source_old = fh.read()
             m |= py_file_mask(mp, key, f, source_old)
             wide |= mp.file_mask(key)
             if rel != old and rel in mp.files:
@@ -414,26 +429,30 @@ def bits(m):
 
 
 def main():
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as fh:
+        tests = json.load(fh)["tests"]
     num = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     mp = Map(MAP)
     number_of = [num.get(t) for t in mp.tests]
     known = set(mp.tests)
     unknown = [t["number"] for t in tests if t["id"] not in known]
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    cdir = os.path.join(DATA, "commits")
+    for name in sorted(n for n in os.listdir(cdir) if n.endswith(".patch")):
+        stem = name[:-6]
         try:
-            files = parse_patch(patch.read_text(errors="replace"))
+            with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as fh:
+                files = parse_patch(fh.read())
             m, wide = select(mp, files, None)
         except Exception as e:  # never crash: fall back to everything
-            print(f"{patch.stem}: {e!r}", file=sys.stderr)
+            print(f"{stem}: {e!r}", file=sys.stderr)
             m, wide = mp.all_mask(), 0
         chosen = [number_of[i] for i in bits(m) if number_of[i] is not None]
         if m and unknown:
             chosen += unknown
         filler = [number_of[i] for i in bits(wide & ~m) if number_of[i] is not None]
         workers = plan([(n, ms[n]) for n in chosen], [(n, ms[n]) for n in filler])
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
+        print(json.dumps({"commit": stem, "workers": workers}))
 
 
 if __name__ == "__main__":
