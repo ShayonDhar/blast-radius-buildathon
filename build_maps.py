@@ -390,6 +390,13 @@ import coverage
 cov = coverage.Coverage(include=[os.path.join(os.getcwd(), "sqlglot", "*")], config_file=False, data_file=None)
 cov.start()
 import sqlglot
+from sqlglot.expressions import core
+made = set()
+orig = core.Expr.__init__
+def init(self, *a, **k):
+    made.add(type(self))
+    return orig(self, *a, **k)
+core.Expr.__init__ = init
 for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
     if not m.name.endswith("__main__"):
         try:
@@ -397,8 +404,17 @@ for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         except Exception:
             pass
 cov.stop()
+core.Expr.__init__ = orig
 d = cov.get_data()
-json.dump({os.path.relpath(f): sorted(d.lines(f) or []) for f in d.measured_files()}, sys.stdout)
+root = os.getcwd() + os.sep
+cls = set()
+for t in made:
+    for k in t.__mro__:
+        f = getattr(sys.modules.get(k.__module__), "__file__", None)
+        if f and f.startswith(root):
+            cls.add(os.path.relpath(f) + "|" + k.__qualname__)
+json.dump({"lines": {os.path.relpath(f): sorted(d.lines(f) or []) for f in d.measured_files()},
+           "classes": sorted(cls)}, sys.stdout)
 """
 
 
@@ -408,9 +424,11 @@ def add_import_lines(checkout, map_in, map_out):
     them to tests because every module is imported before recording starts."""
     out = subprocess.run([sys.executable, "-c", _IMPORT_PROBE], cwd=checkout, capture_output=True,
                          text=True, check=True).stdout
-    lines = json.loads(out)
+    probe = json.loads(out)
+    lines = probe["lines"]
     with gzip.open(map_in, "rt") as fh:
         d = json.load(fh)
+    d["impcls"] = probe["classes"]  # expression classes instantiated while importing sqlglot
     for rel, ls in lines.items():
         if rel not in d["files"]:
             continue
@@ -432,8 +450,66 @@ def add_import_lines(checkout, map_in, map_out):
         json.dump(d, fh, separators=(",", ":"))
 
 
+def add_instantiations(checkout, map_in, map_out, jobs=4):
+    """Add "inst": {"file|Qualname": set id} - the tests that instantiated each sqlglot expression
+    class or a subclass of it (inst_plugin.py). Class-setup and collection work counts for every
+    test of that class or file, like the coverage contexts."""
+    checkout = str(Path(checkout).resolve())
+    with gzip.open(map_in, "rt") as fh:
+        d = json.load(fh)
+    ids = d["tests"]
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "i")
+        env = dict(os.environ, BR_OUT=prefix, SKIP_INTEGRATION="0",
+                   PYTHONPATH=os.pathsep.join([str(HERE), checkout]))
+        subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "inst_plugin", "-p", "no:cacheprovider",
+                        "-n", str(jobs), "tests"], cwd=checkout, env=env,
+                       capture_output=True, text=True)
+        per_ctx = {}
+        for name in os.listdir(tmp):
+            if name.endswith(".inst.json"):
+                with open(os.path.join(tmp, name)) as fh:
+                    for c, ks in json.load(fh).items():
+                        per_ctx.setdefault(c, set()).update(ks)
+
+    def tests_of(ctx):
+        if ctx.startswith("C|"):
+            pre = ctx[2:]
+            return [i for i, t in enumerate(ids) if not pre or t == pre or t.startswith(pre + "::")
+                    or t.startswith(pre + "/") or t.startswith(pre + "[")]
+        node, _, phase = ctx.rpartition("|")
+        if phase in ("setup", "teardown") and node.count("::") >= 2:
+            cls = node.rsplit("::", 1)[0]
+            return [i for i, t in enumerate(ids) if t.startswith(cls + "::")]
+        return [i for i, t in enumerate(ids) if t == node or t.startswith(node + "[")]
+
+    masks = {}
+    for c, ks in per_ctx.items():
+        m = 0
+        for i in tests_of(c):
+            m |= 1 << i
+        if not m:
+            continue
+        for k in ks:
+            masks[k] = masks.get(k, 0) | m
+    w = d["width"]
+    n = len(d["sets"]) // w
+    extra, inst = [], {}
+    for k, m in sorted(masks.items()):
+        inst[k] = n + len(extra)
+        extra.append(format(m, "x").rjust(w, "0"))
+    d["sets"] += "".join(extra)
+    d["inst"] = inst
+    with gzip.open(map_out, "wt", compresslevel=9) as fh:
+        json.dump(d, fh, separators=(",", ":"))
+    print(f"inst: {len(inst)} classes from {len(per_ctx)} contexts", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--inst":  # build_maps.py --inst <checkout> <map in> <map out>
+        add_instantiations(args[1], args[2], args[3])
+        return
     if args and args[0] == "--reformat":
         reformat(args[1], args[2], args[3])
         return

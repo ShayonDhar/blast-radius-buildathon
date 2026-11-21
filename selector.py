@@ -183,6 +183,8 @@ class Map:
                 self.test_files[f] = n + len(self._extra) - 1
             self._cache.update(self._extra)
         self.attrs = d.get("attrs", {})
+        self.inst = d.get("inst", {})
+        self.impcls = set(d.get("impcls", ()))
 
     @property
     def files(self):
@@ -410,6 +412,78 @@ def _func_bodies(text):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
 
 
+def _class_spans(text):
+    """[(first line, last line, qualname)] of every class in `text`, with method bodies cut out:
+    a line inside a class body but outside any function body belongs to the innermost class."""
+    if text is None:
+        return None
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    out = []
+
+    def visit(node, prefix):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, ast.ClassDef):
+                q = prefix + ch.name
+                out.append((ch.lineno, ch.end_lineno, q))
+                visit(ch, q + ".")
+            elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            else:
+                visit(ch, prefix)
+
+    visit(tree, "")
+    return out
+
+
+def class_level_inst(mp, rel, lines, source_old):
+    """Tests that instantiated the class (or a subclass) whose body holds one of `lines`."""
+    if not mp.inst or not lines:
+        return 0
+    m = 0
+    for q in class_level_owners(rel, lines, source_old):
+        if rel + "|" + q in mp.impcls:
+            return mp.all_mask()  # instantiated while sqlglot is imported: an import can now fail
+        sid = mp.inst.get(rel + "|" + q)
+        if sid is not None:
+            m |= mp.mask(sid)
+    return m
+
+
+_owner_cache = {}
+
+
+def class_level_owners(rel, lines, source_old):
+    """Qualnames of the innermost classes whose own body (not a method: decorators, header and body
+    of every function are excluded) holds one of `lines`."""
+    key = (rel, len(source_old or ""))
+    if key not in _owner_cache:
+        import ast
+
+        spans, funcs = _class_spans(source_old) or [], []
+        try:
+            for n in ast.walk(ast.parse(source_old or "")):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    first = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+                    funcs.append((first, n.end_lineno))
+        except SyntaxError:
+            pass
+        _owner_cache[key] = (spans, funcs)
+    spans, funcs = _owner_cache[key]
+    out = set()
+    for ln in lines:
+        if not ln or any(a <= ln <= b for a, b in funcs):
+            continue
+        inner = [c for c in spans if c[0] <= ln <= c[1]]
+        if inner:
+            out.add(min(inner, key=lambda c: c[1] - c[0])[2])
+    return out
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -483,6 +557,10 @@ def py_file_mask(mp, rel, f, source_old):
             if ln and at_import(ln) and bin(mp.span_mask(rel, ln)).count("1") <= IMP_MAX:
                 # every test: some (test_lazy_load) import sqlglot in a subprocess no map can see
                 return mp.all_mask()
+    if rel.startswith("sqlglot/") and INST:
+        # class attributes (arg_types, ...) are consumed when the class is created: every test that
+        # instantiated the class or a subclass can see the change
+        m |= class_level_inst(mp, rel, list(removed) + [x for p in inserts for x in p], source_old)
     for ln in removed:
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
@@ -525,7 +603,8 @@ def py_file_mask(mp, rel, f, source_old):
 
 
 NARROW = True
-IMP_MAX = int(os.environ.get("BR_IMP_MAX", "800"))
+IMP_MAX = int(os.environ.get("BR_IMP_MAX", "1000000"))  # import-time code: always every test
+INST = os.environ.get("BR_INST", "1") == "1"
 
 GIANTS = {
     # id -> (dirs whose edits cannot plausibly change it, files within those dirs that still can)
