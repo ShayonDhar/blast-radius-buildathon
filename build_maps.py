@@ -219,6 +219,70 @@ def subclass_closure(checkout, rels):
     return out
 
 
+PROBED_PREFIXES = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")
+PROBED_FILES = ("sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/tokens.py")
+
+
+def static_blacklist(checkout, rels):
+    """Attribute names that may be consumed outside test time: read inside class-creation hooks
+    (__new__ / __init_subclass__) or at import time by module- or class-level code (for example
+    `**Parent.TRANSFORMS`).  A class-level edit to such a name can change derived state that no
+    test-time attribute read reveals, so those names never get the precise path."""
+    names = set()
+
+    def visit_nonfunc(node):
+        # module / class-body code that runs at import; lambdas and defs run later
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(ch, ast.Attribute):
+                names.add(ch.attr)
+            elif isinstance(ch, ast.Name) and isinstance(ch.ctx, ast.Load):
+                names.add(ch.id)
+            visit_nonfunc(ch)
+
+    for rel in rels:
+        if not rel.startswith("sqlglot/"):
+            continue
+        try:
+            tree = ast.parse(Path(checkout, rel).read_text())
+        except Exception:
+            continue
+        visit_nonfunc(tree)
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ("__new__", "__init_subclass__"):
+                for m in ast.walk(n):
+                    if isinstance(m, ast.Attribute):
+                        names.add(m.attr)
+                    elif isinstance(m, ast.Constant) and isinstance(m.value, str):
+                        names.add(m.value)
+                    elif isinstance(m, ast.Name):
+                        names.add(m.id)
+    return names
+
+
+def class_attr_stmts(path):
+    """[(start, end, qualname, [attr names])] for assignments directly in class bodies."""
+    try:
+        tree = ast.parse(Path(path).read_text())
+    except Exception:
+        return []
+    out = []
+
+    def walk(body, prefix):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                walk(st.body, prefix + [st.name])
+            elif prefix and isinstance(st, (ast.Assign, ast.AnnAssign)):
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if names and len(names) == len(targets) and (isinstance(st, ast.Assign) or st.value is not None):
+                    out.append([st.lineno, st.end_lineno, ".".join(prefix), names])
+
+    walk(tree.body, [])
+    return out
+
+
 def module_of(rel):
     parts = rel[:-3].split("/")
     if parts[-1] == "__init__":
@@ -383,7 +447,9 @@ def main():
     if cache_path and os.path.exists(cache_path):
         import pickle
 
-        line_mask, data_mask, use_mask = pickle.load(open(cache_path, "rb"))
+        loaded = pickle.load(open(cache_path, "rb"))
+        line_mask, data_mask, use_mask = loaded[:3]
+        attr_mask = loaded[3] if len(loaded) > 3 else {}
     else:
         with tempfile.TemporaryDirectory() as tmp:
             # Two passes with different sharding / file order: lines that only get credited
@@ -406,6 +472,10 @@ def main():
             for p in prefixes:
                 covs.append(p + ".cov")
                 covs += sorted(glob.glob(p + ".w*.cov"))
+            attr_mask = {}
+            wattrs = []
+            for p in prefixes:
+                wattrs += sorted(glob.glob(p + ".w*.attrs.json"))
             useds, wopens = [], []
             for p in prefixes:
                 useds += sorted(glob.glob(p + ".w*.used.json"))
@@ -433,6 +503,15 @@ def main():
                     m = cm(ctx)
                     for f in files:
                         use_mask[f] = use_mask.get(f, 0) | m
+                for ctx, keys in oj.get("attrs", {}).items():
+                    m = cm(ctx)
+                    for k in keys:
+                        attr_mask[k] = attr_mask.get(k, 0) | m
+            for u in wattrs:
+                for ctx, keys in json.load(open(u)).items():
+                    m = cm(ctx)
+                    for k in keys:
+                        attr_mask[k] = attr_mask.get(k, 0) | m
             for u in wopens:
                 for ctx, files in json.load(open(u)).items():
                     m = cm(ctx)
@@ -448,7 +527,7 @@ def main():
         if cache_path:
             import pickle
 
-            pickle.dump((line_mask, data_mask, use_mask), open(cache_path, "wb"))
+            pickle.dump((line_mask, data_mask, use_mask, attr_mask), open(cache_path, "wb"))
 
     sets, set_id = [], {}
 
@@ -540,11 +619,18 @@ def main():
             for nm in names:
                 m |= refs.get(nm, 0)
             st_out.append([a, b, sid(m)])
+        cst = class_attr_stmts(os.path.join(checkout, rel)) if (
+            rel.startswith(PROBED_PREFIXES) or rel in PROBED_FILES) else []
         files_out[rel] = {"lines": runs, "spans": spans, "all": sid(allm), "use": sid(direct | allm),
-                          "cuse": sid(um | allm), "stmts": st_out,
+                          "cuse": sid(um | allm), "stmts": st_out, "cstmts": cst,
                           "dead": dead_ranges(os.path.join(checkout, rel), lm) if lm else []}
     data_out = {f: sid(m) for f, m in sorted(data_mask.items())}
+    black = static_blacklist(checkout, list(line_mask))
+    attrs_out = {k: sid(m) for k, m in sorted(attr_mask.items()) if k.rsplit("|", 1)[1] not in black}
+    print(f"attribute keys: {len(attr_mask)} recorded, {len(attrs_out)} precise, "
+          f"{len(black)} blacklisted names", file=sys.stderr)
     result = {
+        "attrs": attrs_out,
         "tests": ids,
         "sets": [format(m, "x") for m in sets],
         "files": files_out,

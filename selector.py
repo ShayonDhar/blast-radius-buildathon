@@ -169,6 +169,7 @@ class Map:
         self._files = {}
         self.data = d["data"]
         self.test_files = d["test_files"]
+        self.attrs = d.get("attrs", {})
 
     @property
     def files(self):
@@ -224,6 +225,24 @@ class Map:
     def is_dead(self, rel, line):
         """Executable function-body line that no test ever ran."""
         return any(a <= line <= b for a, b in self.files[rel].get("dead", ()))
+
+    def attr_mask(self, rel, line):
+        """Tests that read the class attribute(s) assigned on `line` at test time, or None when the
+        statement is not a probed class attribute (or an attribute no test ever read)."""
+        keys = None
+        for a, b, qual, names in self.files[rel].get("cstmts", ()):
+            if a <= line <= b:
+                keys = [rel + "|" + qual + "|" + n for n in names]
+                break
+        if not keys:
+            return None
+        m = 0
+        for k in keys:
+            sid = self.attrs.get(k)
+            if sid is None:
+                return None
+            m |= self.mask(sid)
+        return m
 
     def in_function(self, rel, line):
         return any(a <= line <= b and k == "f" for a, b, k, _ in self.files[rel]["spans"])
@@ -412,6 +431,11 @@ def py_file_mask(mp, rel, f, source_old):
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
             continue  # never executed by any test (and not docstring text)
+        if not mp.in_function(rel, ln):
+            am = mp.attr_mask(rel, ln)
+            if am is not None:
+                m |= am | lm  # precise: tests that read this class attribute (plus lambda-entry hits)
+                continue
         if lm and mp.in_function(rel, ln):
             m |= lm
         elif lm:
