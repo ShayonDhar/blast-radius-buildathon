@@ -107,10 +107,11 @@ def apply_patch(old_text, f):
         out.extend(old[pos:s])
         pos = s
         for tag, content in lines:
-            if tag == " ":
-                out.append(old[pos] if pos < len(old) else content + "\n")
-                pos += 1
-            elif tag == "-":
+            if tag == " " or tag == "-":
+                if pos >= len(old) or old[pos].rstrip("\r\n") != content.rstrip("\r"):
+                    raise ValueError("patch does not match source")
+                if tag == " ":
+                    out.append(old[pos])
                 pos += 1
             else:
                 out.append(content + "\n")
@@ -177,19 +178,41 @@ class Map:
         return (1 << len(self.tests)) - 1
 
 
+def import_breaking_mask(mp, rel):
+    """A module that no longer imports takes down every test importing it."""
+    base = rel.rsplit("/", 1)[-1]
+    if rel.startswith("sqlglot/") or (rel.startswith("tests/") and not base.startswith("test_")):
+        return mp.all_mask()
+    sid = mp.test_files.get(rel)
+    return mp.mask(sid) if sid is not None else mp.all_mask()
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
-    if f["deleted"] or f["new_file"] or f["binary"]:
-        return mp.file_mask(rel)
+    if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
+        return import_breaking_mask(mp, rel)
     if source_old is not None:
         try:
             new_text = apply_patch(source_old, f)
-            if code_tokens(new_text) == code_tokens(source_old):
-                compile(new_text, rel, "exec")
-                return 0
-            compile(new_text, rel, "exec")
         except Exception:
-            return mp.file_mask(rel)  # does not compile / tokenize: every user of the module
+            new_text = None
+        if new_text is not None:
+            try:
+                compile(new_text, rel, "exec")
+            except Exception:
+                return import_breaking_mask(mp, rel)  # does not even compile
+            try:
+                cookie = re.compile(r"coding[:=]")
+                head_old = "".join(source_old.splitlines(keepends=True)[:2])
+                head_new = "".join(new_text.splitlines(keepends=True)[:2])
+                if head_old == head_new or not (cookie.search(head_old) or cookie.search(head_new)):
+                    pass
+                else:
+                    raise ValueError("encoding declaration changed")
+                if code_tokens(new_text) == code_tokens(source_old):
+                    return 0  # comments / blank lines only
+            except Exception:
+                pass
     removed, inserts = changed_lines(f)
     m = 0
     for ln in removed:
@@ -276,7 +299,8 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     mp = Map(MAP)
     number_of = [num.get(t) for t in mp.tests]
-    unknown = [t["number"] for t in tests if t["id"] not in set(mp.tests)]
+    known = set(mp.tests)
+    unknown = [t["number"] for t in tests if t["id"] not in known]
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             files = parse_patch(patch.read_text(errors="replace"))
