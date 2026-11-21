@@ -94,6 +94,56 @@ def stmt_ranges(path):
     return out
 
 
+def top_stmts(path):
+    """Statements outside function bodies: [(start, end, names)].
+    names = identifiers whose users may be affected (defined names + outermost class)."""
+    try:
+        tree = ast.parse(Path(path).read_text())
+    except Exception:
+        return []
+    out = []
+
+    def targets(t):
+        if isinstance(t, ast.Name):
+            return {t.id}
+        if isinstance(t, (ast.Tuple, ast.List)):
+            r = set()
+            for e in t.elts:
+                r |= targets(e)
+            return r
+        return set()
+
+    def walk(body, outer):
+        for st in body:
+            start = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+            names = set()
+            if outer:
+                names.add(outer)
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(st.name)
+                out.append((start, st.end_lineno, names))
+            elif isinstance(st, ast.ClassDef):
+                names.add(st.name)
+                out.append((start, st.end_lineno, names))
+                walk(st.body, outer or st.name)
+            else:
+                if isinstance(st, ast.Assign):
+                    for t in st.targets:
+                        names |= targets(t)
+                elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+                    names |= targets(st.target)
+                out.append((st.lineno, st.end_lineno, names))
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list):
+                        walk(sub, outer)
+                for h in getattr(st, "handlers", []):
+                    walk(h.body, outer)
+
+    walk(tree.body, None)
+    return out
+
+
 def module_of(rel):
     parts = rel[:-3].split("/")
     if parts[-1] == "__init__":
@@ -262,6 +312,30 @@ def main():
                     todo.append(r)
         return seen
 
+    # every source file gets an entry, even if no test executed a line in it
+    for sub in ("sqlglot", "tests"):
+        for f in Path(checkout, sub).rglob("*.py"):
+            line_mask.setdefault(os.path.relpath(f, checkout), {})
+    stmts = {rel: top_stmts(os.path.join(checkout, rel)) for rel in line_mask}
+    needed = set()
+    for lst in stmts.values():
+        for _, _, names in lst:
+            needed |= names
+    refs = {}
+    for rel, lm in line_mask.items():
+        if not lm:
+            continue
+        try:
+            tree = ast.parse(Path(checkout, rel).read_text())
+        except Exception:
+            continue
+        for n in ast.walk(tree):
+            nm = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+            if nm in needed:
+                m = lm.get(n.lineno, 0)
+                if m:
+                    refs[nm] = refs.get(nm, 0) | m
+
     files_out = {}
     for rel, lm in sorted(line_mask.items()):
         runs = []
@@ -284,7 +358,15 @@ def main():
         um = 0
         for r in closure(rel):
             um |= use_mask.get(r, 0)
-        files_out[rel] = {"lines": runs, "spans": spans, "all": sid(allm), "use": sid(um | allm)}
+        direct = use_mask.get(rel, 0)
+        st_out = []
+        for a, b, names in stmts[rel]:
+            m = 0
+            for nm in names:
+                m |= refs.get(nm, 0)
+            st_out.append([a, b, sid(m)])
+        files_out[rel] = {"lines": runs, "spans": spans, "all": sid(allm), "use": sid(direct | allm),
+                          "cuse": sid(um | allm), "stmts": st_out}
     data_out = {f: sid(m) for f, m in sorted(data_mask.items())}
     result = {
         "tests": ids,

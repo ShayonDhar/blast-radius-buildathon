@@ -142,18 +142,23 @@ class Map:
         return 0
 
     def span_mask(self, rel, line):
-        """Tests that ran the innermost def/class around `line`; for lines outside
-        any function (class bodies, module level) also every test that used the module."""
+        """Tests that ran the innermost def/class around `line`. Outside functions
+        (class bodies, module level) also the users of the names that statement defines."""
+        e = self.files[rel]
         best = None
-        for a, b, kind, s in self.files[rel]["spans"]:
+        for a, b, kind, s in e["spans"]:
             if a <= line <= b and (best is None or b - a < best[1] - best[0]):
                 best = (a, b, kind, s)
-        e = self.files[rel]
-        if best is None:
-            return self.mask(e["use"])
-        m = self.mask(best[3])
-        if best[2] != "f":
-            m |= self.mask(e["use"])
+        if best is not None and best[2] == "f":
+            return self.mask(best[3])
+        m = self.mask(best[3]) if best else 0
+        st = None
+        for a, b, s in e["stmts"]:
+            if a <= line <= b and (st is None or b - a < st[1] - st[0]):
+                st = (a, b, s)
+        if st is not None:
+            m |= self.mask(st[2])
+        m |= self.mask(e["use"] if best else e["cuse"])
         return m
 
     def file_mask(self, rel):
