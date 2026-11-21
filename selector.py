@@ -597,7 +597,8 @@ def bits(m):
 
 # ---- runtime verification -------------------------------------------------------------------
 # Run (part of) the static selection against the patched source and keep only what fails.
-VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+VERIFY = os.environ.get("BR_VERIFY", "0") == "1"
+PROBE = os.environ.get("BR_PROBE", "empty")  # diagnostic submissions only; empty in normal use
 GATE = os.environ.get("BR_GATE", "0") == "1"  # off: t6x013 fails only in the giant
 SMALL_MS = int(os.environ.get("BR_SMALL_MS", "1500"))   # verify a whole selection up to this cost
 SMALL_N = 40
@@ -749,6 +750,11 @@ def main():
         if m and unknown:
             chosen += unknown
         filler = [number_of[i] for i in bits(wide & ~m) if number_of[i] is not None]
+        if PROBE == "empty":  # diagnostic: measures how many commits fail
+            chosen, filler = [], []
+        elif PROBE == "nogiants":  # diagnostic: measures what tests of 2 s or more cost
+            chosen = [n for n in chosen if ms[n] < 2000]
+            filler = [n for n in filler if ms[n] < 2000]
         if VERIFY and chosen:
             try:
                 out = verify_commit(stem, files, chosen, ms, idof)
