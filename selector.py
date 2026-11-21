@@ -284,6 +284,59 @@ def comment_only(mp, rel, f):
     return True
 
 
+def _literal(node):
+    import ast
+
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _literal(k) and _literal(v) for k, v in zip(node.keys, node.values))
+    return False
+
+
+def import_time_effects(text):
+    """(dumps of statements that run code at import, {new-assignment name: literal?}) found at
+    module level or in class bodies, outside functions."""
+    import ast
+
+    flags, assigned = set(), {}
+
+    def walk(body):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom, ast.Pass)):
+                continue
+            if isinstance(st, ast.ClassDef):
+                walk(st.body)
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)):
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                lit = st.value is None or _literal(st.value)
+                for t in targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            assigned[n.id] = assigned.get(n.id, True) and lit
+            elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+                continue
+            else:
+                flags.add(ast.dump(st))
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list):
+                        walk(sub)
+
+    walk(ast.parse(text).body)
+    return flags, assigned
+
+
+def adds_import_time_code(source_old, new_text):
+    old_flags, old_assigned = import_time_effects(source_old)
+    new_flags, new_assigned = import_time_effects(new_text)
+    if new_flags - old_flags:
+        return True
+    return any(n not in old_assigned and not lit for n, lit in new_assigned.items())
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -303,6 +356,16 @@ def py_file_mask(mp, rel, f, source_old):
                 compile(new_text, rel, "exec", 0 if full else 0x400)
             except Exception:
                 return import_breaking_mask(mp, rel)  # does not even compile
+            try:
+                removed0, inserts0 = changed_lines(f)
+                outside = any(not mp.in_function(rel, ln) for ln in removed0) or any(
+                    not (mp.in_function(rel, max(a, 1)) and mp.in_function(rel, max(b, 1))) for a, b in inserts0)
+                if outside and adds_import_time_code(source_old, new_text):
+                    return import_breaking_mask(mp, rel)  # new code that runs when the module is imported
+            except SyntaxError:
+                return import_breaking_mask(mp, rel)
+            except Exception:
+                pass
             try:
                 head_old = "".join(source_old.splitlines(keepends=True)[:2])
                 head_new = "".join(new_text.splitlines(keepends=True)[:2])
