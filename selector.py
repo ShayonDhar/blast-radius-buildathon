@@ -352,6 +352,44 @@ def py_file_mask(mp, rel, f, source_old):
     return m
 
 
+GIANTS = {
+    # id -> (dirs whose edits cannot plausibly change it, files within those dirs that still can)
+    "tests/test_generator.py::TestGenerator::test_generator_memory": (
+        ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/typing/", "sqlglot/optimizer/", "sqlglot/executor/"),
+        ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py", "sqlglot/parsers/base.py",
+         "sqlglot/parsers/__init__.py"),
+    ),
+    "tests/test_parser.py::TestParser::test_max_nodes": (
+        ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/",
+         "sqlglot/optimizer/", "sqlglot/executor/"),
+        ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py", "sqlglot/parsers/base.py",
+         "sqlglot/parsers/__init__.py", "sqlglot/generators/base.py", "sqlglot/generators/__init__.py"),
+    ),
+}
+
+
+def prune_giants(mp, files, m):
+    """Drop the two slowest tests that only core files can break, when only peripheral files changed."""
+    paths = [(f["old"], f["new"]) for f in files]
+    for tid, (dirs, core) in GIANTS.items():
+        try:
+            bit = mp.tests.index(tid)
+        except ValueError:
+            continue
+        ok = True
+        for old, new in paths:
+            for p in (old, new):
+                if p.startswith("tests/") and p.endswith(".py"):
+                    ok = False
+                elif p.endswith(".py") and (not p.startswith(dirs) or p in core):
+                    ok = False
+                elif not p.endswith(".py") and not p.startswith("tests/fixtures/"):
+                    ok = False
+        if ok and paths:
+            m &= ~(1 << bit)
+    return m
+
+
 def select(mp, files, extras):
     m = 0
     wide = 0  # files whose full coverage is offered as free filler
@@ -454,6 +492,8 @@ def main():
                 m, wide = mp.all_mask(), 0  # a patch we could not read any change from
             else:
                 m, wide = select(mp, files, None)
+            if m != mp.all_mask():
+                m = prune_giants(mp, files, m)
         except Exception as e:  # never crash: fall back to everything
             print(f"{stem}: {e!r}", file=sys.stderr)
             m, wide = mp.all_mask(), 0

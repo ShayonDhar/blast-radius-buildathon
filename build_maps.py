@@ -199,7 +199,23 @@ def import_graph(checkout, rels):
         if not rel.endswith("__init__.py"):
             pkg = pkg[:-1]
         deps = set()
-        for n in ast.walk(tree):
+
+        def module_level(body):
+            for n in body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if isinstance(n, ast.If) and "TYPE_CHECKING" in ast.dump(n.test):
+                    yield from module_level(n.orelse)
+                    continue
+                yield n
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(n, field, None)
+                    if isinstance(sub, list):
+                        yield from module_level(sub)
+                for h in getattr(n, "handlers", []):
+                    yield from module_level(h.body)
+
+        for n in module_level(tree.body):
             names = []
             if isinstance(n, ast.Import):
                 names = [a.name for a in n.names]
@@ -401,7 +417,12 @@ def main():
         return set_id[m]
 
     for rel, lm in line_mask.items():
+        fn_spans = [(x, y) for x, y, k in spans_of(os.path.join(checkout, rel)) if k == "f"]
         for a, b in stmt_ranges(os.path.join(checkout, rel)):
+            # Only inside functions: in a class-level dict one executed lambda entry must not
+            # make the neighbouring entries look covered (they run at import time only).
+            if not any(x <= a <= y for x, y in fn_spans):
+                continue
             m = 0
             for line in range(a, b + 1):
                 m |= lm.get(line, 0)
