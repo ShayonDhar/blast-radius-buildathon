@@ -281,58 +281,69 @@ def main():
             cache[ctx] = ctx_mask(ctx)
         return cache[ctx]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # Two passes with different sharding / file order: lines that only get credited
-        # to whichever test warms a cache first end up credited to both orders.
-        prefixes, jobs_list = [], []
-        for pi, (pj, pseed) in enumerate([(jobs, seed), (max(jobs - 1, 1), 7)]):
-            for si, sh in enumerate(shard_files(tests, pj)):
-                prefixes.append(os.path.join(tmp, f"p{pi}s{si}"))
-                jobs_list.append((sh, pseed))
-        with cf.ThreadPoolExecutor(4) as ex:
-            rcs = list(ex.map(lambda a: run_shard(checkout, a[0][0], a[1], a[0][1]), zip(jobs_list, prefixes)))
-        print("shard return codes", rcs, file=sys.stderr)
+    cache_path = os.environ.get("BR_CACHE")
+    if cache_path and os.path.exists(cache_path):
+        import pickle
 
-        line_mask = {}  # file -> {line: mask}
-        data_mask = {}
-        use_mask = {}
-        import glob
+        line_mask, data_mask, use_mask = pickle.load(open(cache_path, "rb"))
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Two passes with different sharding / file order: lines that only get credited
+            # to whichever test warms a cache first end up credited to both orders.
+            prefixes, jobs_list = [], []
+            for pi, (pj, pseed) in enumerate([(jobs, seed), (max(jobs - 1, 1), 7)]):
+                for si, sh in enumerate(shard_files(tests, pj)):
+                    prefixes.append(os.path.join(tmp, f"p{pi}s{si}"))
+                    jobs_list.append((sh, pseed))
+            with cf.ThreadPoolExecutor(4) as ex:
+                rcs = list(ex.map(lambda a: run_shard(checkout, a[0][0], a[1], a[0][1]), zip(jobs_list, prefixes)))
+            print("shard return codes", rcs, file=sys.stderr)
 
-        covs = []
-        for p in prefixes:
-            covs.append(p + ".cov")
-            covs += sorted(glob.glob(p + ".w*.cov"))
-        useds = []
-        for p in prefixes:
-            useds += sorted(glob.glob(p + ".w*.used.json"))
-        for c in covs:
-            cd = coverage.CoverageData(basename=c)
-            cd.read()
-            for fn in cd.measured_files():
-                rel = os.path.relpath(fn, checkout)
-                lm = line_mask.setdefault(rel, {})
-                for line, ctxs in cd.contexts_by_lineno(fn).items():
-                    m = 0
-                    for c in ctxs:
-                        m |= cm(c)
-                    if m:
-                        lm[line] = lm.get(line, 0) | m
-        for p in prefixes:
-            oj = json.load(open(p + ".opens.json"))
-            for ctx, files in oj["opens"].items():
-                m = cm(ctx)
-                for f in files:
-                    if not f.endswith((".py", ".pyc")):
-                        data_mask[f] = data_mask.get(f, 0) | m
-            for ctx, files in oj["used"].items():
-                m = cm(ctx)
-                for f in files:
-                    use_mask[f] = use_mask.get(f, 0) | m
-        for u in useds:
-            for ctx, files in json.load(open(u)).items():
-                m = cm(ctx)
-                for f in files:
-                    use_mask[f] = use_mask.get(f, 0) | m
+            line_mask = {}  # file -> {line: mask}
+            data_mask = {}
+            use_mask = {}
+            import glob
+
+            covs = []
+            for p in prefixes:
+                covs.append(p + ".cov")
+                covs += sorted(glob.glob(p + ".w*.cov"))
+            useds = []
+            for p in prefixes:
+                useds += sorted(glob.glob(p + ".w*.used.json"))
+            for c in covs:
+                cd = coverage.CoverageData(basename=c)
+                cd.read()
+                for fn in cd.measured_files():
+                    rel = os.path.relpath(fn, checkout)
+                    lm = line_mask.setdefault(rel, {})
+                    for line, ctxs in cd.contexts_by_lineno(fn).items():
+                        m = 0
+                        for c in ctxs:
+                            m |= cm(c)
+                        if m:
+                            lm[line] = lm.get(line, 0) | m
+            for p in prefixes:
+                oj = json.load(open(p + ".opens.json"))
+                for ctx, files in oj["opens"].items():
+                    m = cm(ctx)
+                    for f in files:
+                        if not f.endswith((".py", ".pyc")):
+                            data_mask[f] = data_mask.get(f, 0) | m
+                for ctx, files in oj["used"].items():
+                    m = cm(ctx)
+                    for f in files:
+                        use_mask[f] = use_mask.get(f, 0) | m
+            for u in useds:
+                for ctx, files in json.load(open(u)).items():
+                    m = cm(ctx)
+                    for f in files:
+                        use_mask[f] = use_mask.get(f, 0) | m
+
+        if cache_path:
+            import pickle
+
+            pickle.dump((line_mask, data_mask, use_mask), open(cache_path, "wb"))
 
     sets, set_id = [], {}
 
@@ -350,6 +361,10 @@ def main():
             if m:
                 for line in range(a, b + 1):
                     lm[line] = lm.get(line, 0) | m
+    # every source file gets an entry, even if no test executed a line in it
+    for sub in ("sqlglot", "tests"):
+        for f in Path(checkout, sub).rglob("*.py"):
+            line_mask.setdefault(os.path.relpath(f, checkout), {})
     graph = import_graph(checkout, list(line_mask))
     importers = {}
     for r, deps in graph.items():
@@ -365,10 +380,6 @@ def main():
                     todo.append(r)
         return seen
 
-    # every source file gets an entry, even if no test executed a line in it
-    for sub in ("sqlglot", "tests"):
-        for f in Path(checkout, sub).rglob("*.py"):
-            line_mask.setdefault(os.path.relpath(f, checkout), {})
     stmts = {rel: top_stmts(os.path.join(checkout, rel)) for rel in line_mask}
     needed = set()
     for lst in stmts.values():

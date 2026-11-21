@@ -184,7 +184,9 @@ class Map:
                 st = (a, b, s)
         if st is not None:
             m |= self.mask(st[2])
-        m |= self.mask(e["use"] if best else e["cuse"])
+        cuse = self.mask(e["cuse"])
+        # Users of the importing modules, unless that is nearly everything (expressions, helpers).
+        m |= cuse if best is None or bin(cuse).count("1") <= 700 else self.mask(e["use"])
         return m
 
     def file_mask(self, rel):
