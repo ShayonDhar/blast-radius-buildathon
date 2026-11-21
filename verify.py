@@ -81,7 +81,7 @@ class Verifier:
         try:
             ov = self._build_overlay(patch_files)
             res_path = ov + ".json"
-            wall = 30 + 4 * (expected_seconds if expected_seconds is not None else len(test_ids))
+            wall = 5 + 3 * (expected_seconds if expected_seconds is not None else len(test_ids))
             sys.stdout.flush()
             sys.stderr.flush()
             pid = os.fork()
@@ -187,6 +187,10 @@ class _Recorder:
 def _child(ov, test_ids, res_path, timeout_s, stop_first=False):
     try:
         os.setpgid(0, 0)
+    except Exception:
+        pass
+    try:  # a runaway allocation fails this child, not the whole container
+        resource.setrlimit(resource.RLIMIT_AS, (3 << 30, 3 << 30))
     except Exception:
         pass
     devnull = os.open(os.devnull, os.O_WRONLY)

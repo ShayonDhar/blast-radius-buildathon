@@ -618,7 +618,7 @@ def _get_verifier():
             sys.path.insert(0, APP)
             from verify import Verifier
 
-            v = Verifier(SRC, timeout_s=30)
+            v = Verifier(SRC, timeout_s=5)
             v.start()
         except Exception:
             VERIFY = False  # no test environment in this image: static answers only
