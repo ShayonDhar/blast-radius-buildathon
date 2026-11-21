@@ -111,9 +111,11 @@ Quoted from the organisers' sheet, with notes.
 
 ## 4. Where we stand
 
-**Final entry: `a3fe8e3b3c3e2148e101b8953e2221c549f42343`** (branch `claude/cool-davinci-4mugkp`,
-the static selector). It must be picked explicitly on the site. The default is the best board score,
-which is the older `1668ee9`, and that commit missed 4 of the first 15 crafted new-kind edits.
+**Final entry**: the newest code commit on branch `claude/cool-davinci-4mugkp`: `a3fe8e3` plus the
+`arg_types` narrowing (section 5). Its hash is in the git log, commit "Narrow arg_types edits…". Until
+that commit is submitted once and picked, the pick is `a3fe8e3b3c3e2148e101b8953e2221c549f42343`.
+Either way it must be picked explicitly on the site. The default is the best board score, which is
+the older `1668ee9`, and that commit missed 4 of the first 15 crafted new-kind edits.
 
 ### Board history (practice set)
 
@@ -126,7 +128,8 @@ which is the older `1668ee9`, and that commit missed 4 of the first 15 crafted n
 | `8fa32bb` | ? | ? | ? | ? | diagnostic probe: drop every test ≥ 2 s (result not recorded) |
 | `a3fe8e3` | 182.0 | 181.659 | 0.38 | 0 | **chosen final**: static + robustness fixes |
 | `3bc18f7` | 182.1 | 181.659 | 0.39 | 0 | leaderboard branch, strict shadow gate (never fired) |
-| `aca4e4d` | pending | | | | leaderboard branch, loose gate |
+| `aca4e4d` | 471.4 | 465.974 | 5.38 | **1** | leaderboard branch, loose gate: saved 15.7 s simulated but missed a commit where a giant fails and 800 ms of cheap tests pass |
+| next | | | | | `a3fe8e3` + `arg_types` narrowing (final candidate) |
 
 - The practice-board leader is at **130.8**.
 - The board set is *not* the 30 sample commits. Our sample simulated time is 172.455, not
@@ -143,6 +146,28 @@ which is the older `1668ee9`, and that commit missed 4 of the first 15 crafted n
 
 - **Complement audit**: for all 142 mutant and crafted commits, every test the selector leaves out
   was run on the patched tree. No test fails.
+
+### `arg_types` narrowing (on top of `a3fe8e3`)
+
+An edit to a line of an `arg_types = …` statement directly in an expression-class body (in
+`sqlglot/expressions/`, for a class that tests instantiate but nothing instantiates at import) selects:
+- the tests that instantiated that class or a subclass (`inst`), and
+- the tests that ran lines of the class,
+
+instead of every user of the module's names. Nothing outside the class reads `arg_types` at import
+except subclasses (covered by the MRO) and `Select` (instantiated at import, so already all tests).
+Copies and unpickling go through `__init__`, so the instantiation map sees them. Other class
+attributes (`_sql_names`, …) keep the wide fallback, because the parser reads them at import. Switch:
+`BR_EXPR_NARROW`.
+
+| Set | `a3fe8e3` | with narrowing |
+|---|---|---|
+| sample | 172.455 s, 0 misses | 166.968 s, 0 misses (`ktz3` 7.6 → 2.1 s) |
+| 121 mutants | 1163.5 s, 0 misses | 1135.7 s, 0 misses |
+| 20 crafted new-kind edits, 24 adversarial | — | identical selections |
+| 8 crafted `arg_types` edits (`na1`–`na8`: add, remove, reorder keys, flip required) | — | complement audit: 0 failing among 1574–1616 left-out tests each |
+
+Container CPU on the sample: 0.35 s.
 
 ### Where the sample waste is
 
@@ -315,6 +340,7 @@ Do not re-propose these without new evidence.
 | `attr_mask` falling back to `dialect_users` | wider: sample 172.5 → 172.9, mutants 1161.5 → 1195.0; reverted |
 | Extended giant pruning by file | looked safe on stored truth, but that truth undercounted multi-line subtest failures; reverted |
 | Strict shadow gate on the board | identical to static: no board commit qualified |
+| Loose gate (cheap tests pass ⇒ drop tests ≥ 7 s) on the board | 1 miss (471.4); giant skipping is closed |
 
 ## 9. Open problems and ideas
 
@@ -333,8 +359,9 @@ Do not re-propose these without new evidence.
 - **Board waste is unknown.** The `8fa32bb` probe (drop every test ≥ 2 s) gives about the floor any
   giant-skipping approach can reach on the board. If its simulated time is above ~131, no gate tuning
   beats the leader.
-- **Sound precision gains** on class-attribute fallbacks (`4d63`, `ktz3`): record which dict keys and
-  attributes each test reads, then select only the readers of the changed key.
+- **Sound precision gains** on class-attribute fallbacks. `ktz3` is done (the `arg_types`
+  narrowing). `4d63` is not: Snowflake's tokenizer `NUMERIC_ESCAPES` is consumed while the class is
+  created, and narrowing it would need a map pass that records dict-key reads during class creation.
 - **Re-measure exact small-selection verification** (`BR_SMALL_MS=1500`) with the cheaper verifier.
   Locally it saved 8.3 s of simulated time for 4.45 s of CPU.
 
