@@ -188,8 +188,50 @@ def import_graph(checkout, rels):
     return graph
 
 
+def string_ranges(path):
+    """Line ranges (first, last) of multi-line string tokens: a '#' line inside one is text."""
+    import tokenize
+
+    out = []
+    try:
+        with open(path, "rb") as fh:
+            for t in tokenize.tokenize(fh.readline):
+                if t.type in (tokenize.STRING, getattr(tokenize, "FSTRING_START", -1)) and t.end[0] > t.start[0]:
+                    out.append([t.start[0], t.end[0]])
+                elif t.type == getattr(tokenize, "FSTRING_START", -1):
+                    out.append([t.start[0], t.start[0]])
+    except Exception:
+        return [[1, 10**9]]  # unknown: treat the whole file as string
+    return out
+
+
+def pack(result, checkout, out):
+    """Runtime layout: per-file entries are JSON strings parsed on demand and all
+    bitsets live in one fixed-width hex string, so the selector pays only for what it touches."""
+    width = max(1, (len(result["tests"]) + 3) // 4)
+    hexes = [h.rjust(width, "0") for h in result["sets"]]
+    files = {}
+    for rel, e in result["files"].items():
+        e = dict(e)
+        e["strs"] = string_ranges(os.path.join(checkout, rel))
+        files[rel] = json.dumps(e, separators=(",", ":"))
+    packed = dict(result, sets="".join(hexes), width=width, files=files)
+    with gzip.open(out, "wt", compresslevel=9) as f:
+        json.dump(packed, f, separators=(",", ":"))
+
+
+def reformat(old, new, checkout):
+    """Convert an old-layout map (no strs, list of sets) without re-running tests."""
+    with gzip.open(old, "rt") as fh:
+        d = json.load(fh)
+    pack(d, checkout, new)
+
+
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--reformat":
+        reformat(args[1], args[2], args[3])
+        return
     checkout, tests_json, out = args[0], args[1], args[2]
     jobs = int(args[args.index("--jobs") + 1]) if "--jobs" in args else 4
     seed = int(args[args.index("--shuffle") + 1]) if "--shuffle" in args else None
@@ -386,8 +428,7 @@ def main():
         "data": data_out,
         "test_files": {f: sid(m) for f, m in file_mask.items()},
     }
-    with gzip.open(out, "wt", compresslevel=9) as f:
-        json.dump(result, f, separators=(",", ":"))
+    pack(result, checkout, out)
     print(f"wrote {out}: {len(sets)} sets, {len(files_out)} files, {len(data_out)} data files",
           file=sys.stderr)
 

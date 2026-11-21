@@ -134,15 +134,31 @@ class Map:
             d = json.load(fh)
         self.tests = d["tests"]
         self._sets = d["sets"]
+        self._w = d["width"]
         self._cache = {}
-        self.files = d["files"]
+        self._raw = d["files"]
+        self._files = {}
         self.data = d["data"]
         self.test_files = d["test_files"]
+
+    @property
+    def files(self):
+        return self
+
+    def __contains__(self, rel):
+        return rel in self._raw
+
+    def __getitem__(self, rel):
+        e = self._files.get(rel)
+        if e is None:
+            e = self._files[rel] = json.loads(self._raw[rel])
+        return e
 
     def mask(self, i):
         m = self._cache.get(i)
         if m is None:
-            m = self._cache[i] = int(self._sets[i], 16)
+            w = self._w
+            m = self._cache[i] = int(self._sets[i * w:(i + 1) * w], 16)
         return m
 
     def line_mask(self, rel, line):
@@ -187,10 +203,36 @@ def import_breaking_mask(mp, rel):
     return mp.mask(sid) if sid is not None else mp.all_mask()
 
 
+def comment_only(mp, rel, f):
+    """True when every changed line is blank or a whole-line comment outside a
+    multi-line string and no line continuation can be affected."""
+    strs = mp.files[rel]["strs"]
+    for start, lines in f["hunks"]:
+        old = start
+        prev = None
+        for tag, content in lines:
+            if tag != " ":
+                t = content.strip()
+                if t and not t.startswith("#"):
+                    return False
+                if any(a <= old <= b for a, b in strs) or any(a < old - 1 < b for a, b in strs):
+                    return False
+                if prev is not None and prev.rstrip().endswith("\\"):
+                    return False
+                if t.startswith("#") and old <= 2:
+                    return False  # could be an encoding declaration
+            prev = content
+            if tag != "+":
+                old += 1
+    return True
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
         return import_breaking_mask(mp, rel)
+    if f["hunks"] and comment_only(mp, rel, f):
+        return 0
     if source_old is not None:
         try:
             new_text = apply_patch(source_old, f)
@@ -209,7 +251,8 @@ def py_file_mask(mp, rel, f, source_old):
                     pass
                 else:
                     raise ValueError("encoding declaration changed")
-                if code_tokens(new_text) == code_tokens(source_old):
+                touches_comment = any("#" in c for _, ls in f["hunks"] for t, c in ls if t != " ")
+                if touches_comment and code_tokens(new_text) == code_tokens(source_old):
                     return 0  # comments / blank lines only
             except Exception:
                 pass
