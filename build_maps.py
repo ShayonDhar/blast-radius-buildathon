@@ -240,10 +240,15 @@ def main():
         return cache[ctx]
 
     with tempfile.TemporaryDirectory() as tmp:
-        shards = shard_files(tests, jobs)
-        prefixes = [os.path.join(tmp, f"s{i}") for i in range(len(shards))]
-        with cf.ThreadPoolExecutor(len(shards)) as ex:
-            rcs = list(ex.map(lambda a: run_shard(checkout, a[0], a[1], seed), zip(shards, prefixes)))
+        # Two passes with different sharding / file order: lines that only get credited
+        # to whichever test warms a cache first end up credited to both orders.
+        prefixes, jobs_list = [], []
+        for pi, (pj, pseed) in enumerate([(jobs, seed), (max(jobs - 1, 1), 7)]):
+            for si, sh in enumerate(shard_files(tests, pj)):
+                prefixes.append(os.path.join(tmp, f"p{pi}s{si}"))
+                jobs_list.append((sh, pseed))
+        with cf.ThreadPoolExecutor(4) as ex:
+            rcs = list(ex.map(lambda a: run_shard(checkout, a[0][0], a[1], a[0][1]), zip(jobs_list, prefixes)))
         print("shard return codes", rcs, file=sys.stderr)
 
         line_mask = {}  # file -> {line: mask}
