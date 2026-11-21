@@ -72,10 +72,15 @@ class Verifier:
         return ov
 
     # -- run ----------------------------------------------------------------------------------
-    def run(self, patch_files, test_ids, expected_seconds=None, stop_first=False):
+    def run(self, patch_files, test_ids, expected_seconds=None, stop_first=False, shadow=False):
         """-> (failing node ids or file/collector ids, ok, cpu_seconds)."""
         if not self.started:
             self.start()
+        # TestExecutor's class setup parses every TPC fixture (~1.4 s CPU) and creates duckdb views
+        # (~0.5 s) that only the TPC tests use: do both on first use instead (same code, same data)
+        lazy = not any(
+            r in ("tests/test_executor.py", "tests/helpers.py") or r.startswith("tests/fixtures/") for r in patch_files
+        )
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         ov = None
         try:
@@ -88,7 +93,7 @@ class Verifier:
             if pid == 0:  # child
                 code = 1
                 try:
-                    code = _child(ov, test_ids, res_path, self.timeout_s, stop_first)
+                    code = _child(ov, test_ids, res_path, self.timeout_s, stop_first, lazy, shadow)
                 finally:
                     os._exit(code)
             deadline = time.monotonic() + wall
@@ -111,9 +116,11 @@ class Verifier:
                     break
                 time.sleep(0.005)
             failing, ok = set(), False
+            self.last = {}
             if status is not None and os.path.exists(res_path):
                 with open(res_path) as fh:
                     d = json.load(fh)
+                self.last = d
                 failing = set(d["failed"])
                 ok = d["complete"]
         except Exception as e:  # pragma: no cover
@@ -132,6 +139,105 @@ class Verifier:
 
     def close(self):
         pass
+
+
+def _open_fixture(path):
+    with open(path, "rb") as f:
+        gzipped = f.read(2) == b"\x1f\x8b"
+    if gzipped:
+        import gzip
+
+        return gzip.open(path, "rt", newline="")
+    return open(path, encoding="utf-8", newline="")
+
+
+def _parse_tpc(file_name):
+    """Exactly the row parsing of TestExecutor.setUpClass (stdlib only)."""
+    import ast
+    import csv
+
+    reader = csv.reader(_open_fixture(file_name), delimiter="|")
+    rows, ctypes = [], []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for v in row:
+                try:
+                    ctypes.append(type(ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return rows
+
+
+def _install_lazy_tpc():
+    """Give TestExecutor a setUpClass that builds the TPC tables and duckdb views on first use.
+    Must run before pytest collects the module (pytest binds setUpClass at collection)."""
+    try:
+        import importlib
+
+        te = importlib.import_module("tests.test_executor")
+    except BaseException:
+        return
+    cls = getattr(te, "TestExecutor", None)
+    orig = None if cls is None else cls.__dict__.get("setUpClass")
+    if orig is None:
+        return
+
+    class _LazyConn:
+        """A duckdb connection whose CSV views are created on first use: the cheap tests never
+        query them, and creating them costs ~0.5 s of CPU per run."""
+
+        def __init__(self, views):
+            self._views, self._conn = views, None
+
+        def _real(self):
+            if self._conn is None:
+                self._conn = te.duckdb.connect()
+                for sql in self._views:
+                    self._conn.execute(sql)
+            return self._conn
+
+        def close(self):
+            if self._conn is not None:
+                self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._real(), name)
+
+    class _LazyTables:
+        """Class attribute that parses the TPC tables when a test first reads it."""
+
+        def __init__(self, name, directory, schema):
+            self.name, self.directory, self.schema = name, directory, schema
+
+        def __get__(self, obj, owner):
+            tables = {}
+            for table, columns in self.schema.items():
+                tables[table] = te.Table(columns=columns, rows=_parse_tpc(f"{self.directory}{table}.csv.gz"))
+            setattr(owner, self.name, tables)
+            return tables
+
+    def _views(directory, schema):
+        return [
+            f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{directory}{table}.csv.gz', delim='|', header=True, columns={columns})
+                """
+            for table, columns in schema.items()
+        ]
+
+    def setUpClass(klass):
+        klass.tpch_conn = _LazyConn(_views(te.DIR_TPCH, te.TPCH_SCHEMA))
+        klass.tpcds_conn = _LazyConn(_views(te.DIR_TPCDS, te.TPCDS_SCHEMA))
+        klass.tpch_tables = _LazyTables("tpch_tables", te.DIR_TPCH, te.TPCH_SCHEMA)
+        klass.tpcds_tables = _LazyTables("tpcds_tables", te.DIR_TPCDS, te.TPCDS_SCHEMA)
+        klass.cache = {}
+        klass.tpch_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        klass.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+    cls.setUpClass = classmethod(setUpClass)
 
 
 class _SyncExecutor:
@@ -187,7 +293,7 @@ class _Recorder:
             self.collect_errors.add(report.nodeid)
 
 
-def _child(ov, test_ids, res_path, timeout_s, stop_first=False):
+def _child(ov, test_ids, res_path, timeout_s, stop_first=False, lazy=False, shadow=False):
     try:
         os.setpgid(0, 0)
     except Exception:
@@ -212,6 +318,27 @@ def _child(ov, test_ids, res_path, timeout_s, stop_first=False):
     cf.ProcessPoolExecutor = _SyncExecutor
     import pytest
 
+    seen = {"hit": set(), "div": set()}
+    if shadow:
+        import builtins
+
+        def _br_shadow(i, old, new):
+            """Evaluate the edited expression both ways; record whether the results ever differ."""
+            b = new()
+            seen["hit"].add(i)
+            if i not in seen["div"]:
+                try:
+                    a = old()
+                    same = a is b or (type(a) is type(b) and bool(a == b))
+                except BaseException:
+                    same = False
+                if not same:
+                    seen["div"].add(i)
+            return b
+
+        builtins._br_shadow = _br_shadow
+    if lazy:
+        _install_lazy_tpc()
     rec = _Recorder()
     args = [*test_ids, "-q", "-p", "no:cacheprovider", "-p", "no:randomly", "-p", "no:xdist",
             "--timeout", str(timeout_s), "-o", "addopts=", "--rootdir", ov, "--assert=plain"]
@@ -223,6 +350,7 @@ def _child(ov, test_ids, res_path, timeout_s, stop_first=False):
         rc = -1
     complete = rc in (0, 1)  # 0 all passed, 1 some failed; anything else = unreliable
     with open(res_path, "w") as fh:
-        json.dump({"failed": sorted(rec.failed), "complete": complete, "rc": int(rc) if isinstance(rc, int) else -1,
+        json.dump({"failed": sorted(rec.failed), "complete": complete,
+                   "hit": sorted(seen["hit"]), "div": sorted(seen["div"]), "rc": int(rc) if isinstance(rc, int) else -1,
                    "ran": len(rec.ran)}, fh)
     return 0

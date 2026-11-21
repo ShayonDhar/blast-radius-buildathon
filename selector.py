@@ -741,6 +741,8 @@ GATE_MS = int(os.environ.get("BR_GATE_MS", "4000"))     # budget for the cheap p
 SENT_MS = int(os.environ.get("BR_SENT_MS", "0"))        # sentinel budget when the cheap part is too big
 GATED = {"tests/test_executor.py::TestExecutor::test_execute_tpcds"}
 GATED_FILE = "tests/test_executor.py"
+GIANT_MS = int(os.environ.get("BR_GIANT_MS", "0"))  # also gate every test at least this slow (0: off)
+SAME_MS = int(os.environ.get("BR_SAME_MS", "0"))    # cap on the giant-file tests run (0: all cheap ones)
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # expensive per-run setup
 WALL_BUDGET = float(os.environ.get("BR_WALL", "90"))
 _T0 = time.monotonic()
@@ -794,11 +796,101 @@ def _expand(entries, ids):
     return out
 
 
+SHADOW = os.environ.get("BR_SHADOW", "1") == "1"
+# drop a giant only on shadow evidence: every edited expression instrumented, reached, never different
+STRICT = os.environ.get("BR_SHADOW_STRICT", "1") == "1"
+_NO_SHADOW = ("Call", "Lambda", "Yield", "YieldFrom", "Await", "NamedExpr", "ListComp", "SetComp", "DictComp",
+              "GeneratorExp", "Starred")
+
+
+def shadow_instrument(old_text, new_text, base=0):
+    """Rewrite each edited expression E_new (old form E_old) inside a function body as
+    _br_shadow(i, lambda: (E_old), lambda: (E_new)), which returns E_new's value and records
+    whether E_old would have given a different one. Only side-effect-free expressions (no calls,
+    no assignment targets) qualify. -> (text, number of sites) or None when the edit is not of
+    that shape."""
+    import ast
+
+    try:
+        to, tn = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    pairs = []
+
+    def ok_expr(e):
+        if type(e).__name__ in ("Slice", "Starred"):
+            return False
+        for n in ast.walk(e):
+            if type(n).__name__ in _NO_SHADOW:
+                return False
+            ctx = getattr(n, "ctx", None)
+            if ctx is not None and not isinstance(ctx, ast.Load):
+                return False
+        return True
+
+    def walk(a, b, in_func):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.expr):
+            if ast.dump(a) == ast.dump(b):
+                return True
+            if not in_func or not ok_expr(a) or not ok_expr(b):
+                return False
+            pairs.append((a, b))
+            return True
+        if isinstance(a, ast.AST):
+            if ast.dump(a) == ast.dump(b):
+                return True
+            for name in a._fields:
+                inner = in_func
+                if name == "body" and isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    inner = True
+                elif name == "body" and isinstance(a, ast.ClassDef):
+                    inner = False
+                if not walk(getattr(a, name, None), getattr(b, name, None), inner):
+                    return False
+            return True
+        if isinstance(a, list):
+            return len(a) == len(b) and all(walk(x, y, in_func) for x, y in zip(a, b))
+        return a == b
+
+    if not walk(to, tn, False) or not pairs:
+        return None
+    lines = new_text.splitlines(keepends=True)
+    starts = [0]
+    for ln in lines:
+        starts.append(starts[-1] + len(ln))
+
+    def offset(lineno, col):
+        line = lines[lineno - 1]
+        return starts[lineno - 1] + len(line.encode("utf-8")[:col].decode("utf-8", errors="replace"))
+
+    edits = []
+    for i, (a, b) in enumerate(pairs):
+        old_src = ast.get_source_segment(old_text, a)
+        new_src = ast.get_source_segment(new_text, b)
+        if old_src is None or new_src is None:
+            return None
+        lo, hi = offset(b.lineno, b.col_offset), offset(b.end_lineno, b.end_col_offset)
+        edits.append((lo, hi, f"_br_shadow({base + i}, (lambda: ({old_src}\n)), (lambda: ({new_src}\n)))"))
+    out = new_text
+    for lo, hi, rep in sorted(edits, reverse=True):
+        out = out[:lo] + rep + out[hi:]
+    try:
+        ast.parse(out)
+    except SyntaxError:
+        return None
+    return out, len(pairs)
+
+
 def verify_commit(stem, files, chosen, ms, idof):
     """Return a refined list of test numbers, or None to keep the static selection."""
     if time.monotonic() - _T0 > WALL_BUDGET:
         return None
-    giants = [n for n in chosen if idof.get(n) in GATED] if GATE else []
+    if GATE:
+        giants = [n for n in chosen if idof.get(n) in GATED or (GIANT_MS and ms[n] >= GIANT_MS)]
+    else:
+        giants = []
     rest = [n for n in chosen if n not in giants]
     cost = sum(ms[n] for n in rest)
     sentinel = False
@@ -809,19 +901,29 @@ def verify_commit(stem, files, chosen, ms, idof):
         if cost > GATE_MS:
             if SENT_MS <= 0:
                 return None
-            # too much to run: run the cheapest part; if it all passes, drop only the giant
+            # too much to run: run the cheapest part; if it all passes, drop the giants
+            gfiles = {idof[n].split("::", 1)[0] for n in giants}
             sentinel, acc, part = True, 0, []
-            for n in sorted((n for n in rest if not idof[n].startswith(HEAVY)), key=lambda n: ms[n]):
+            for n in sorted((n for n in rest if idof[n].split("::", 1)[0] not in gfiles), key=lambda n: ms[n]):
                 if acc + ms[n] > SENT_MS:
                     break
                 part.append(n)
                 acc += ms[n]
-            # the giant's own test file exercises the same code path: its cheap tests always run
-            same = [n for n in rest if idof[n].startswith(GATED_FILE) and ms[n] < 2000]
-            if not same:
-                return None
-            part += same
-            acc += sum(ms[n] for n in same)
+            # each giant's own test file exercises the same code paths: its cheap tests always run
+            for gf in sorted(gfiles):
+                same = sorted((n for n in rest if idof[n].startswith(gf + "::") and ms[n] < 2000), key=lambda n: ms[n])
+                if not same:
+                    return None
+                if SAME_MS:
+                    take, sacc = [], 0
+                    for n in same:
+                        if take and sacc + ms[n] > SAME_MS:
+                            break
+                        take.append(n)
+                        sacc += ms[n]
+                    same = take
+                part += same
+                acc += sum(ms[n] for n in same)
             done = set(part)
             keep, rest, cost = [n for n in rest if n not in done], part, acc
     else:
@@ -831,9 +933,37 @@ def verify_commit(stem, files, chosen, ms, idof):
     pf = _patched_files(files)
     if pf is None:
         return None
+    shadow = False
+    if giants and SHADOW:
+        # evidence beyond "the cheap tests pass": the edited expressions give the same values
+        sh, shadow, nsites = {}, True, 0
+        for rel, text in pf.items():
+            if not rel.startswith("sqlglot/"):
+                shadow = False
+                break
+            with open(os.path.join(SRC, rel), encoding="utf-8") as fh:
+                r = shadow_instrument(fh.read(), text, nsites)
+            if r is None:
+                shadow = False
+                break
+            sh[rel] = r[0]
+            nsites += r[1]
+        if shadow:
+            pf = sh
+        elif STRICT:
+            return None
     run = sorted(rest, key=lambda n: (idof[n].startswith(HEAVY), ms[n]))
-    failing, ok, _cpu = _get_verifier().run(pf, [idof[n] for n in run], expected_seconds=cost / 1000,
-                                           stop_first=stop_first)
+    v = _get_verifier()
+    failing, ok, _cpu = v.run(pf, [idof[n] for n in run], expected_seconds=cost / 1000,
+                              stop_first=stop_first, shadow=shadow)
+    if shadow:
+        last = getattr(v, "last", {}) or {}
+        if os.environ.get("BR_DEBUG"):
+            print(f"{stem}: shadow hit={last.get('hit')} div={last.get('div')}", file=sys.stderr)
+        if last.get("div"):
+            return None
+        if STRICT and len(last.get("hit") or ()) < nsites:
+            return None
     if os.environ.get("BR_DEBUG"):
         print(f"{stem}: verify n={len(run)} rec={cost}ms cpu={_cpu:.2f} ok={ok} failing={len(failing)}", file=sys.stderr)
     if not ok:
