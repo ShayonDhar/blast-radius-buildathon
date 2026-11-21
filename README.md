@@ -129,7 +129,7 @@ that commit missed 4 of the first 15 crafted new-kind edits.
 | `3bc18f7` | 182.1 | 181.659 | 0.39 | 0 | leaderboard branch, strict shadow gate (never fired) |
 | `aca4e4d` | 471.4 | 465.974 | 5.38 | **1** | leaderboard branch, loose gate: saved 15.7 s simulated but missed a commit where a giant fails and 800 ms of cheap tests pass |
 | `653b03e` | 182.2 | 181.659 | 0.55 | 0 | `a3fe8e3` + `arg_types` narrowing |
-| next | | | | | + import-time attribute reads (`impattrs`): final candidate |
+| `5979f82` | 182.1 | 181.659 | 0.40 | 0 | + import-time attribute reads (`impattrs`): **final candidate** |
 
 - The practice-board leader is at **130.8**.
 - The board set is *not* the 30 sample commits. Our sample simulated time is 172.455, not
@@ -195,6 +195,7 @@ Every test the selector left out was run on the patched tree.
 | `q1`–`q10` | method override added to a dialect generator, class base, property return, executor function table (2), test-body edit, dialect constant, base-dialect constant, registry key normalisation, error formatting | **`q8` missed** (fixed by `impattrs`); others 0 misses |
 | `s1`–`s7` | module-level constants: `UNESCAPED_SEQUENCES` (merged into every dialect at import), `STRICT_TIME_FORMATS`, DuckDB `_SEQ_BASE` template, `WEEK_START_DAY_TO_DOW`, `AFTER_HAVING_MODIFIER_TRANSFORMS` lambda, `helper.DATE_UNITS`, `ASCII_LOWER`/`ASCII_UPPER` swapped | 0 misses |
 | `t1`–`t10` | Snowflake `NORMALIZATION_STRATEGY`, parser `FUNCTIONS` entry, BigQuery `TYPE_MAPPING` entry, Snowflake tokenizer keyword removed, `diff.py`, `lineage.py` walk order, `schema.normalize_name` default, planner copy, JSON-path escapes, `scope.py` condition | 0 misses (`t5`: 4 selected, 1616 left out) |
+| `u1`–`u9` | new module imported by an existing one, helper signature change with some callers updated (3 files), unused function deleted, executor aggregate row order (10 selected), DuckDB typing set, test-class setup data, new public function in `sqlglot/__init__.py`, module rename + importer update (all tests) | 0 misses |
 
 ### Where the sample waste is
 
