@@ -484,6 +484,69 @@ def class_level_owners(rel, lines, source_old):
     return out
 
 
+EXPR_NARROW = os.environ.get("BR_EXPR_NARROW", "1") == "1"
+
+
+_atl_cache = {}
+
+
+def _arg_types_lines(rel, source_old):
+    """Line numbers covered by `arg_types = ...` / `arg_types: ... = ...` statements directly in a
+    class body."""
+    key = (rel, len(source_old or ""))
+    if key not in _atl_cache:
+        import ast
+
+        out = set()
+        try:
+            tree = ast.parse(source_old or "")
+        except SyntaxError:
+            tree = None
+        for node in ast.walk(tree) if tree is not None else ():
+            if isinstance(node, ast.ClassDef):
+                for st in node.body:
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else []
+                    if targets and all(isinstance(t, ast.Name) and t.id == "arg_types" for t in targets):
+                        out.update(range(st.lineno, st.end_lineno + 1))
+        _atl_cache[key] = out
+    return _atl_cache[key]
+
+
+def expr_class_narrow(mp, rel, lines, source_old):
+    """For a line of an `arg_types` assignment in the body of an expression class in
+    sqlglot/expressions/ that tests instantiated: the tests that ran any line of that class. Its instantiators (and those
+    of subclasses) are added by class_level_inst. Such attributes (arg_types, ...) reach behaviour
+    only through instances; copies and unpickling go through __init__ too, so instantiation bounds
+    them. None when this does not apply (keep the wider fallback)."""
+    if not (EXPR_NARROW and INST and mp.inst and rel.startswith("sqlglot/expressions/")):
+        return None
+    owners = set()
+    for ln in lines:
+        if not ln or mp.in_function(rel, ln):
+            return None
+        if ln not in _arg_types_lines(rel, source_old):
+            return None  # other class attributes (_sql_names, ...) are read at import by other code
+        o = class_level_owners(rel, [ln], source_old)
+        if len(o) != 1:
+            return None
+        owners |= o
+    if len(owners) != 1:
+        return None
+    q = next(iter(owners))
+    if rel + "|" + q in mp.impcls or mp.inst.get(rel + "|" + q) is None:
+        return None
+    m = 0
+    e = mp.files[rel]
+    for ln in lines:
+        best = None
+        for a, b, kind, sid in e["spans"]:
+            if kind == "c" and a <= ln <= b and (best is None or b - a < best[1] - best[0]):
+                best = (a, b, sid)
+        if best is not None:
+            m |= mp.mask(best[2])
+    return m
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -575,7 +638,8 @@ def py_file_mask(mp, rel, f, source_old):
         elif lm:
             m |= lm | mp.stmt_refs(rel, ln)  # class-level line that also runs in tests (lambda entries)
         else:
-            m |= mp.span_mask(rel, ln)
+            nm = expr_class_narrow(mp, rel, [ln], source_old)
+            m |= mp.span_mask(rel, ln) if nm is None else nm
     lines_old = source_old.splitlines() if source_old is not None else None
     for (prev, nxt), added in zip(inserts, insert_texts(f)):
         indent = min((len(t) - len(t.lstrip()) for t in added if t.strip()), default=0)
@@ -598,7 +662,11 @@ def py_file_mask(mp, rel, f, source_old):
             m |= mp.span_mask(rel, max(prev, 1)) | mp.span_mask(rel, max(nxt, 1))
             m |= mp.line_mask(rel, prev) | mp.line_mask(rel, nxt)
         else:
-            m |= mp.nonfunc_mask(rel, max(prev, 1)) | mp.nonfunc_mask(rel, max(nxt, 1))
+            nm = expr_class_narrow(mp, rel, [max(prev, 1), max(nxt, 1)], source_old)
+            if nm is None:
+                m |= mp.nonfunc_mask(rel, max(prev, 1)) | mp.nonfunc_mask(rel, max(nxt, 1))
+            else:
+                m |= nm
     return m
 
 
