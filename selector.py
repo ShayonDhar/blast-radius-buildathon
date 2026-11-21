@@ -598,7 +598,7 @@ def bits(m):
 # ---- runtime verification -------------------------------------------------------------------
 # Run (part of) the static selection against the patched source and keep only what fails.
 VERIFY = os.environ.get("BR_VERIFY", "0") == "1"
-PROBE = os.environ.get("BR_PROBE", "nogiants")  # diagnostic submissions only; empty in normal use
+PROBE = os.environ.get("BR_PROBE", "")  # diagnostic submissions only; empty in normal use
 GATE = os.environ.get("BR_GATE", "0") == "1"  # off: t6x013 fails only in the giant
 SMALL_MS = int(os.environ.get("BR_SMALL_MS", "1500"))   # verify a whole selection up to this cost
 SMALL_N = 40
