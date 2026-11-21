@@ -99,6 +99,26 @@ def changed_lines(f):
     return removed, inserts
 
 
+def insert_texts(f):
+    """Added lines of each insertion group, in the same order changed_lines reports them."""
+    out = []
+    for start, lines in f["hunks"]:
+        grp = None
+        for tag, content in lines + [(" ", "")]:
+            if tag == " ":
+                if grp and grp[2] and (grp[1] == 0 or len(grp[2]) > grp[1]):
+                    out.append(grp[2])
+                grp = None
+                continue
+            if grp is None:
+                grp = [0, 0, []]
+            if tag == "-":
+                grp[1] += 1
+            else:
+                grp[2].append(content)
+    return out
+
+
 def apply_patch(old_text, f):
     old = old_text.splitlines(keepends=True)
     out, pos = [], 0
@@ -189,6 +209,32 @@ class Map:
         m |= cuse if best is None or bin(cuse).count("1") <= 700 else self.mask(e["use"])
         return m
 
+    def in_function(self, rel, line):
+        return any(a <= line <= b and k == "f" for a, b, k, _ in self.files[rel]["spans"])
+
+    def stmt_refs(self, rel, line):
+        st = None
+        for a, b, s in self.files[rel]["stmts"]:
+            if a <= line <= b and (st is None or b - a < st[1] - st[0]):
+                st = (a, b, s)
+        return self.mask(st[2]) if st else 0
+
+    def nonfunc_mask(self, rel, line, source_old=None):
+        """Change outside any function body: class attributes / module-level statements."""
+        base = rel.rsplit("/", 1)[-1]
+        if rel.startswith("tests/") and not base.startswith("test_"):
+            return self.all_mask()  # helpers import-time state is shared by every test module
+        e = self.files[rel]
+        best = None
+        for a, b, kind, s in e["spans"]:
+            if kind == "c" and a <= line <= b and (best is None or b - a < best[1] - best[0]):
+                best = (a, b, s)
+        m = self.mask(best[2]) if best else 0
+        m |= self.stmt_refs(rel, line)
+        cuse = self.mask(e["cuse"])
+        m |= cuse if best is None or bin(cuse).count("1") <= 700 else self.mask(e["use"])
+        return m
+
     def file_mask(self, rel):
         return self.mask(self.files[rel]["all"])
 
@@ -262,10 +308,35 @@ def py_file_mask(mp, rel, f, source_old):
     m = 0
     for ln in removed:
         lm = mp.line_mask(rel, ln)
-        m |= lm if lm else mp.span_mask(rel, ln)
-    for prev, nxt in inserts:
-        m |= mp.span_mask(rel, max(prev, 1)) | mp.span_mask(rel, max(nxt, 1))
-        m |= mp.line_mask(rel, prev) | mp.line_mask(rel, nxt)
+        if lm and mp.in_function(rel, ln):
+            m |= lm
+        elif lm:
+            m |= lm | mp.stmt_refs(rel, ln)  # class-level line that also runs in tests (lambda entries)
+        else:
+            m |= mp.span_mask(rel, ln)
+    lines_old = source_old.splitlines() if source_old is not None else None
+    for (prev, nxt), added in zip(inserts, insert_texts(f)):
+        indent = min((len(t) - len(t.lstrip()) for t in added if t.strip()), default=0)
+        inner = None
+        for a, b, kind, _ in mp.files[rel]["spans"]:
+            if kind == "f" and a <= max(prev, 1) and nxt <= b and (inner is None or b - a < inner[1] - inner[0]):
+                inner = (a, b)
+        body = False
+        if inner is not None and lines_old is not None and inner[0] - 1 < len(lines_old):
+            hdr = lines_old[inner[0] - 1]
+            # first line after decorators that starts with def/async def
+            k = inner[0] - 1
+            while k < len(lines_old) and not lines_old[k].lstrip().startswith(("def ", "async def ")):
+                k += 1
+            hdr = lines_old[min(k, len(lines_old) - 1)]
+            body = indent > len(hdr) - len(hdr.lstrip())
+        elif inner is not None:
+            body = True
+        if body:
+            m |= mp.span_mask(rel, max(prev, 1)) | mp.span_mask(rel, max(nxt, 1))
+            m |= mp.line_mask(rel, prev) | mp.line_mask(rel, nxt)
+        else:
+            m |= mp.nonfunc_mask(rel, max(prev, 1)) | mp.nonfunc_mask(rel, max(nxt, 1))
     return m
 
 
@@ -285,6 +356,10 @@ def select(mp, files, extras):
             wide |= mp.file_mask(key)
             if rel != old and rel in mp.files:
                 m |= mp.file_mask(rel)
+        elif rel.startswith("sqlglotc/") or rel.startswith("sqlglot-integration-tests/"):
+            for name in ("tests/test_sqlglotc.py", "tests/test_integration_loader.py"):
+                if name in mp.test_files:
+                    m |= mp.mask(mp.test_files[name])
         elif rel.endswith(".py"):
             # new python file nothing has imported yet
             for name in ("tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py"):

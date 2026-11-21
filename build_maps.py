@@ -94,7 +94,7 @@ def stmt_ranges(path):
     return out
 
 
-def top_stmts(path):
+def top_stmts(path, subs=None):
     """Statements outside function bodies: [(start, end, names)].
     names = identifiers whose users may be affected (defined names + outermost class)."""
     try:
@@ -119,6 +119,7 @@ def top_stmts(path):
             names = set()
             if outer:
                 names.add(outer)
+                names |= (subs or {}).get(outer, set())
             # Inside a class only the outermost class name counts: its attributes
             # (arg_types, TRANSFORMS, ...) are reached through its instances, and
             # generic attribute names would match half the code base.
@@ -147,6 +148,32 @@ def top_stmts(path):
                     walk(h.body, outer)
 
     walk(tree.body, None)
+    return out
+
+
+def subclass_closure(checkout, rels):
+    """class name -> names of all (transitive) subclasses defined in the checkout."""
+    direct = {}
+    for rel in rels:
+        try:
+            tree = ast.parse(Path(checkout, rel).read_text())
+        except Exception:
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ClassDef):
+                for b in n.bases:
+                    bn = b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else None
+                    if bn:
+                        direct.setdefault(bn, set()).add(n.name)
+    out = {}
+    for c in direct:
+        seen, todo = set(), [c]
+        while todo:
+            for d in direct.get(todo.pop(), ()):
+                if d not in seen:
+                    seen.add(d)
+                    todo.append(d)
+        out[c] = seen
     return out
 
 
@@ -189,17 +216,24 @@ def import_graph(checkout, rels):
 
 
 def string_ranges(path):
-    """Line ranges (first, last) of multi-line string tokens: a '#' line inside one is text."""
+    """Line ranges (first, last) of multi-line string tokens, f-strings included:
+    a '#' line inside one is text, not a comment."""
     import tokenize
 
-    out = []
+    out, stack = [], []
+    fs = getattr(tokenize, "FSTRING_START", -1)
+    fe = getattr(tokenize, "FSTRING_END", -2)
     try:
         with open(path, "rb") as fh:
             for t in tokenize.tokenize(fh.readline):
-                if t.type in (tokenize.STRING, getattr(tokenize, "FSTRING_START", -1)) and t.end[0] > t.start[0]:
+                if t.type == tokenize.STRING and t.end[0] > t.start[0]:
                     out.append([t.start[0], t.end[0]])
-                elif t.type == getattr(tokenize, "FSTRING_START", -1):
-                    out.append([t.start[0], t.start[0]])
+                elif t.type == fs:
+                    stack.append(t.start[0])
+                elif t.type == fe and stack:
+                    first = stack.pop()
+                    if t.end[0] > first:
+                        out.append([first, t.end[0]])
     except Exception:
         return [[1, 10**9]]  # unknown: treat the whole file as string
     return out
@@ -261,7 +295,13 @@ def main():
             nid = ctx[2:]
             f = nid.split("::")[0]
             if nid == f:
-                return file_mask.get(f, 0)
+                if f in file_mask:
+                    return file_mask[f]
+                m = 0  # a package / directory collector
+                for k, v in file_mask.items():
+                    if k.startswith(f.rstrip("/") + "/"):
+                        m |= v
+                return m
             m = 0
             for c, cm in class_mask.items():
                 if c == nid or c.startswith(nid + "::"):
@@ -334,6 +374,12 @@ def main():
                     m = cm(ctx)
                     for f in files:
                         use_mask[f] = use_mask.get(f, 0) | m
+            for u in wopens:
+                for ctx, files in json.load(open(u)).items():
+                    m = cm(ctx)
+                    for f in files:
+                        if not f.endswith((".py", ".pyc")):
+                            data_mask[f] = data_mask.get(f, 0) | m
             for u in useds:
                 for ctx, files in json.load(open(u)).items():
                     m = cm(ctx)
@@ -380,7 +426,8 @@ def main():
                     todo.append(r)
         return seen
 
-    stmts = {rel: top_stmts(os.path.join(checkout, rel)) for rel in line_mask}
+    subs = subclass_closure(checkout, list(line_mask))
+    stmts = {rel: top_stmts(os.path.join(checkout, rel), subs) for rel in line_mask}
     needed = set()
     for lst in stmts.values():
         for _, _, names in lst:

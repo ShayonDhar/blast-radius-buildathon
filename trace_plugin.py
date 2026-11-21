@@ -102,6 +102,7 @@ class _Tagged:
                 config_file=False,
             )
             _cov.start()
+            sys.addaudithook(_audit)
         _switch(self.ctx)
         try:
             return self.fn(*a, **k)
@@ -110,6 +111,8 @@ class _Tagged:
             _cov.save()
             with open(f"{_OUT}.w{os.getpid()}.used.json", "w") as f:
                 json.dump({k: sorted(v) for k, v in _used.items()}, f)
+            with open(f"{_OUT}.w{os.getpid()}.opens.json", "w") as f:
+                json.dump({k: sorted(v) for k, v in _opens.items()}, f)
 
 
 def _patch_pools():
