@@ -11,5 +11,5 @@ RUN python -c "import io,tarfile,urllib.request as u; d=u.urlopen('https://codel
     && chmod -R a+rX /app
 COPY selector.py verify.py maps.json.gz /app/
 RUN chmod a+r /app/selector.py /app/verify.py /app/maps.json.gz
-ENV BR_VERIFY=1 BR_GATE=1 BR_SMALL_MS=0 BR_SENT_MS=150 BR_SAME_MS=150 BR_GIANT_MS=3000
+ENV BR_VERIFY=1 BR_GATE=1 BR_SMALL_MS=0 BR_SENT_MS=800 BR_GIANT_MS=7000 BR_SHADOW_STRICT=0
 CMD ["python", "/app/selector.py"]

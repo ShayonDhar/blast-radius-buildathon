@@ -42,3 +42,10 @@ Local results (sample: 30 commits; mutants: 121 with full-suite truth; novel: 20
 
 The gate rests on evidence from a sample of tests, not on a proof: it is meant for the practice
 board. The final entry stays the static selector.
+
+Board result for the strict gate (`3bc18f7`): 181.659 s simulated, 0.39 s CPU, which is identical to
+the static selector. No scored commit had a fully instrumentable edit, so the gate never ran. The
+image now uses the loose gate: `BR_SHADOW_STRICT=0` with 800 ms of cheap tests, gating only tests
+of 7 s or more (`test_execute_tpcds`, `test_max_nodes`). Edits that cannot be instrumented are gated
+on the cheap tests passing; instrumented edits also need equal values. Locally: sample 130.5 s,
+mutants 1010.1 s (static 1163.5), 0 misses on sample, mutants and novel edits.
