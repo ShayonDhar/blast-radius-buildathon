@@ -470,6 +470,19 @@ def py_file_mask(mp, rel, f, source_old):
 
         if any(not in_body(ln) for ln in removed) or any(not (in_body(p) and in_body(q)) for p, q in inserts):
             m |= twide
+    # Function bodies that run while sqlglot is imported (metaclasses, __init_subclass__, table
+    # builders) shape module state every test sees, but the map credits them only to the few
+    # tests that run them again later. When such a function is not run by most tests at test
+    # time, the map cannot bound an edit to it, so every test is selected.
+    imp = mp.files[rel].get("imp") if rel.startswith("sqlglot/") else None
+    if imp:
+        def at_import(n):
+            return any(a <= n <= b for a, b in imp)
+
+        for ln in list(removed) + [x for p in inserts for x in p]:
+            if ln and at_import(ln) and bin(mp.span_mask(rel, ln)).count("1") <= IMP_MAX:
+                # every test: some (test_lazy_load) import sqlglot in a subprocess no map can see
+                return mp.all_mask()
     for ln in removed:
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
@@ -512,6 +525,7 @@ def py_file_mask(mp, rel, f, source_old):
 
 
 NARROW = True
+IMP_MAX = int(os.environ.get("BR_IMP_MAX", "800"))
 
 GIANTS = {
     # id -> (dirs whose edits cannot plausibly change it, files within those dirs that still can)

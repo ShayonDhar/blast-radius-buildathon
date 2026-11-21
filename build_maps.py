@@ -383,10 +383,62 @@ def reformat(old, new, checkout):
     pack(d, checkout, new)
 
 
+_IMPORT_PROBE = """
+import json, os, pkgutil, sys
+sys.path.insert(0, os.getcwd())
+import coverage
+cov = coverage.Coverage(include=[os.path.join(os.getcwd(), "sqlglot", "*")], config_file=False, data_file=None)
+cov.start()
+import sqlglot
+for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if not m.name.endswith("__main__"):
+        try:
+            __import__(m.name)
+        except Exception:
+            pass
+cov.stop()
+d = cov.get_data()
+json.dump({os.path.relpath(f): sorted(d.lines(f) or []) for f in d.measured_files()}, sys.stdout)
+"""
+
+
+def add_import_lines(checkout, map_in, map_out):
+    """Add "imp" to every sqlglot file entry: lines inside function bodies that run while sqlglot is
+    imported (metaclasses, __init_subclass__, table builders). The per-test map never charges
+    them to tests because every module is imported before recording starts."""
+    out = subprocess.run([sys.executable, "-c", _IMPORT_PROBE], cwd=checkout, capture_output=True,
+                         text=True, check=True).stdout
+    lines = json.loads(out)
+    with gzip.open(map_in, "rt") as fh:
+        d = json.load(fh)
+    for rel, ls in lines.items():
+        if rel not in d["files"]:
+            continue
+        tree = ast.parse(Path(checkout, rel).read_text())
+        bodies = [(n.body[0].lineno, n.end_lineno) for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
+        inside = sorted(l for l in ls if any(a <= l <= b for a, b in bodies))
+        ranges = []
+        for l in inside:
+            if ranges and l == ranges[-1][1] + 1:
+                ranges[-1][1] = l
+            else:
+                ranges.append([l, l])
+        if ranges:
+            e = json.loads(d["files"][rel])
+            e["imp"] = ranges
+            d["files"][rel] = json.dumps(e, separators=(",", ":"))
+    with gzip.open(map_out, "wt", compresslevel=9) as fh:
+        json.dump(d, fh, separators=(",", ":"))
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "--reformat":
         reformat(args[1], args[2], args[3])
+        return
+    if args and args[0] == "--imp":  # build_maps.py --imp <checkout> <map in> <map out>
+        add_import_lines(args[1], args[2], args[3])
         return
     checkout, tests_json, out = args[0], args[1], args[2]
     jobs = int(args[args.index("--jobs") + 1]) if "--jobs" in args else 4
