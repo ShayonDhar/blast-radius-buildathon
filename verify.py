@@ -138,8 +138,11 @@ class _SyncExecutor:
     """Stand-in for ProcessPoolExecutor inside the verifier child: runs tasks in-process
     (spawning workers would re-import sqlglot per worker and dominate CPU)."""
 
-    def __init__(self, *a, **k):
-        pass
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        if initializer is not None:  # a worker would run this once, on unpickled arguments
+            import pickle
+
+            initializer(*pickle.loads(pickle.dumps(tuple(initargs))))
 
     def submit(self, fn, /, *args, **kwargs):
         import pickle
@@ -187,10 +190,6 @@ class _Recorder:
 def _child(ov, test_ids, res_path, timeout_s, stop_first=False):
     try:
         os.setpgid(0, 0)
-    except Exception:
-        pass
-    try:  # a runaway allocation fails this child, not the whole container
-        resource.setrlimit(resource.RLIMIT_AS, (3 << 30, 3 << 30))
     except Exception:
         pass
     devnull = os.open(os.devnull, os.O_WRONLY)
