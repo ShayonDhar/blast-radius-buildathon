@@ -207,6 +207,9 @@ class Map:
         if best is not None and best[2] == "f":
             return self.mask(best[3])
         m = self.mask(best[3]) if best else 0
+        du = self.dialect_users(rel) if NARROW else None
+        if du is not None:
+            return m | du
         st = None
         for a, b, s in e["stmts"]:
             if a <= line <= b and (st is None or b - a < st[1] - st[0]):
@@ -228,6 +231,23 @@ class Map:
                 st = (a, b, s)
         return self.mask(st[2]) if st else 0
 
+    def dialect_users(self, rel):
+        """For sqlglot/{dialects,parsers,generators,typing}/NAME.py of a concrete dialect:
+        tests that used that dialect (get_or_raise MRO) or ran lines of its files; else None."""
+        parts = rel.split("/")
+        if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "parsers", "generators", "typing"):
+            name = parts[2][:-3]
+            if name in ("dialect", "base", "__init__", "python", "mysql_base", "_typing"):
+                return None
+            m = 0
+            for d in ("dialects", "parsers", "generators", "typing"):
+                r = f"sqlglot/{d}/{name}.py"
+                if r in self._raw:
+                    e = self.files[r]
+                    m |= self.mask(e["use"])
+            return m
+        return None
+
     def nonfunc_mask(self, rel, line, source_old=None):
         """Change outside any function body: class attributes / module-level statements."""
         base = rel.rsplit("/", 1)[-1]
@@ -239,6 +259,9 @@ class Map:
             if kind == "c" and a <= line <= b and (best is None or b - a < best[1] - best[0]):
                 best = (a, b, s)
         m = self.mask(best[2]) if best else 0
+        du = self.dialect_users(rel) if NARROW else None
+        if du is not None:
+            return m | du
         m |= self.stmt_refs(rel, line)
         cuse = self.mask(e["cuse"])
         m |= cuse if best is None or bin(cuse).count("1") <= 700 else self.mask(e["use"])
@@ -415,12 +438,14 @@ def py_file_mask(mp, rel, f, source_old):
     return m
 
 
+NARROW = True
+
 GIANTS = {
     # id -> (dirs whose edits cannot plausibly change it, files within those dirs that still can)
     "tests/test_generator.py::TestGenerator::test_generator_memory": (
-        ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/typing/", "sqlglot/optimizer/", "sqlglot/executor/"),
+        ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/", "sqlglot/optimizer/", "sqlglot/executor/"),
         ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py", "sqlglot/parsers/base.py",
-         "sqlglot/parsers/__init__.py"),
+         "sqlglot/parsers/__init__.py", "sqlglot/generators/base.py", "sqlglot/generators/__init__.py"),
     ),
     "tests/test_parser.py::TestParser::test_max_nodes": (
         ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/",
@@ -449,7 +474,17 @@ def prune_giants(mp, files, m):
                 elif not p.endswith(".py") and not p.startswith("tests/fixtures/"):
                     ok = False
         if ok and paths:
-            m &= ~(1 << bit)
+            direct = 0
+            for f in files:
+                key = f["old"]
+                if key in mp and key.endswith(".py"):
+                    removed, inserts = changed_lines(f)
+                    for ln in removed:
+                        direct |= mp.line_mask(key, ln)
+                    for a, b in inserts:
+                        direct |= mp.line_mask(key, max(a, 1)) | mp.line_mask(key, max(b, 1))
+            if not (direct >> bit) & 1:
+                m &= ~(1 << bit)
     return m
 
 
