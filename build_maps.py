@@ -629,13 +629,14 @@ def main():
     attrs_out = {k: sid(m) for k, m in sorted(attr_mask.items()) if k.rsplit("|", 1)[1] not in black}
     print(f"attribute keys: {len(attr_mask)} recorded, {len(attrs_out)} precise, "
           f"{len(black)} blacklisted names", file=sys.stderr)
+    test_files_out = {f: sid(m) for f, m in file_mask.items()}  # intern before "sets" is written
     result = {
         "attrs": attrs_out,
         "tests": ids,
         "sets": [format(m, "x") for m in sets],
         "files": files_out,
         "data": data_out,
-        "test_files": {f: sid(m) for f, m in file_mask.items()},
+        "test_files": test_files_out,
     }
     pack(result, checkout, out)
     print(f"wrote {out}: {len(sets)} sets, {len(files_out)} files, {len(data_out)} data files",

@@ -170,6 +170,18 @@ class Map:
         self._files = {}
         self.data = d["data"]
         self.test_files = d["test_files"]
+        n = len(self._sets) // self._w
+        bad = [f for f, i in self.test_files.items() if i >= n]
+        if bad:  # ids past the stored sets: rebuild those masks from the test ids
+            self._extra = {}
+            for f in bad:
+                m = 0
+                for k, t in enumerate(self.tests):
+                    if t.startswith(f + "::"):
+                        m |= 1 << k
+                self._extra[n + len(self._extra)] = m
+                self.test_files[f] = n + len(self._extra) - 1
+            self._cache.update(self._extra)
         self.attrs = d.get("attrs", {})
 
     @property
@@ -384,6 +396,20 @@ def adds_import_time_code(source_old, new_text):
     return any(n not in old_assigned and not lit for n, lit in new_assigned.items())
 
 
+def _func_bodies(text):
+    """[(first body line, last line)] of every function in `text`; None if it does not parse."""
+    if text is None:
+        return None
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    return [(n.body[0].lineno, n.end_lineno) for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -428,6 +454,22 @@ def py_file_mask(mp, rel, f, source_old):
                 pass
     removed, inserts = changed_lines(f)
     m = 0
+    # Test modules are imported during collection, so their import-time lines (module and class
+    # level, def headers with default values, decorators) are credited to whichever collector ran
+    # first. Treat such lines as reaching every test that touched or imports the file.
+    tbody = None
+    if rel.startswith("tests/"):
+        tbody, twide = _func_bodies(source_old), mp.mask(mp.files[rel]["all"]) | mp.mask(mp.files[rel]["cuse"])
+        if rel in mp.test_files:
+            twide |= mp.mask(mp.test_files[rel])
+        if tbody is None:
+            return twide | import_breaking_mask(mp, rel) if source_old is None else twide
+
+        def in_body(n):
+            return any(a <= n <= b for a, b in tbody)
+
+        if any(not in_body(ln) for ln in removed) or any(not (in_body(p) and in_body(q)) for p, q in inserts):
+            m |= twide
     for ln in removed:
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
