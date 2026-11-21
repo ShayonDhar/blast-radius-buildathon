@@ -348,9 +348,10 @@ def main():
             for p in prefixes:
                 covs.append(p + ".cov")
                 covs += sorted(glob.glob(p + ".w*.cov"))
-            useds = []
+            useds, wopens = [], []
             for p in prefixes:
                 useds += sorted(glob.glob(p + ".w*.used.json"))
+                wopens += sorted(glob.glob(p + ".w*.opens.json"))
             for c in covs:
                 cd = coverage.CoverageData(basename=c)
                 cd.read()
