@@ -185,6 +185,7 @@ class Map:
         self.attrs = d.get("attrs", {})
         self.inst = d.get("inst", {})
         self.impcls = set(d.get("impcls", ()))
+        self.impattrs = set(d.get("impattrs", ()))
 
     @property
     def files(self):
@@ -547,6 +548,54 @@ def expr_class_narrow(mp, rel, lines, source_old):
     return m
 
 
+_cstmt_cache = {}
+
+
+def _class_stmts(rel, source_old):
+    """[(first line, last line, class qualname, target names)] of statements directly in a class body."""
+    key = (rel, len(source_old or ""))
+    if key not in _cstmt_cache:
+        import ast
+
+        out = []
+
+        def visit(node, prefix):
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, ast.ClassDef):
+                    q = prefix + ch.name
+                    for st in ch.body:
+                        tg = []
+                        if isinstance(st, ast.Assign):
+                            tg = st.targets
+                        elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+                            tg = [st.target]
+                        names = [t.id for t in tg if isinstance(t, ast.Name)]
+                        if names:
+                            out.append((st.lineno, st.end_lineno, q, names))
+                    visit(ch, q + ".")
+                elif not isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    visit(ch, prefix)
+
+        try:
+            visit(ast.parse(source_old or ""), "")
+        except SyntaxError:
+            pass
+        _cstmt_cache[key] = out
+    return _cstmt_cache[key]
+
+
+def import_read_attr(mp, rel, lines, source_old):
+    """True when one of `lines` lies in a class attribute that code read while sqlglot was imported,
+    outside the creation of that class and its subclasses (impattrs): e.g. SQL templates parsed at
+    import read Dialect.NULL_ORDERING and keep the result in module state no test reads it from."""
+    if not mp.impattrs or all(not ln or mp.in_function(rel, ln) for ln in lines):
+        return False
+    for a, b, q, names in _class_stmts(rel, source_old):
+        if any(ln and a <= ln <= b for ln in lines) and any(rel + "|" + q + "|" + n in mp.impattrs for n in names):
+            return True
+    return False
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -620,6 +669,9 @@ def py_file_mask(mp, rel, f, source_old):
             if ln and at_import(ln) and bin(mp.span_mask(rel, ln)).count("1") <= IMP_MAX:
                 # every test: some (test_lazy_load) import sqlglot in a subprocess no map can see
                 return mp.all_mask()
+    if rel.startswith("sqlglot/") and import_read_attr(mp, rel, list(removed) + [x for p in inserts for x in p],
+                                                       source_old):
+        return mp.all_mask()
     if rel.startswith("sqlglot/") and INST:
         # class attributes (arg_types, ...) are consumed when the class is created: every test that
         # instantiated the class or a subclass can see the change

@@ -111,11 +111,10 @@ Quoted from the organisers' sheet, with notes.
 
 ## 4. Where we stand
 
-**Final entry**: the newest code commit on branch `claude/cool-davinci-4mugkp`: `a3fe8e3` plus the
-`arg_types` narrowing (section 5). Its hash is in the git log, commit "Narrow arg_types edits…". Until
-that commit is submitted once and picked, the pick is `a3fe8e3b3c3e2148e101b8953e2221c549f42343`.
-Either way it must be picked explicitly on the site. The default is the best board score, which is
-the older `1668ee9`, and that commit missed 4 of the first 15 crafted new-kind edits.
+**Final entry**: the newest code commit on branch `claude/cool-davinci-4mugkp`. That is `a3fe8e3`
+plus the `arg_types` narrowing (`653b03e`) plus import-time attribute reads (`impattrs`). It must be
+picked explicitly on the site. The default is the best board score, which is the older `1668ee9`, and
+that commit missed 4 of the first 15 crafted new-kind edits.
 
 ### Board history (practice set)
 
@@ -129,7 +128,8 @@ the older `1668ee9`, and that commit missed 4 of the first 15 crafted new-kind e
 | `a3fe8e3` | 182.0 | 181.659 | 0.38 | 0 | **chosen final**: static + robustness fixes |
 | `3bc18f7` | 182.1 | 181.659 | 0.39 | 0 | leaderboard branch, strict shadow gate (never fired) |
 | `aca4e4d` | 471.4 | 465.974 | 5.38 | **1** | leaderboard branch, loose gate: saved 15.7 s simulated but missed a commit where a giant fails and 800 ms of cheap tests pass |
-| next | | | | | `a3fe8e3` + `arg_types` narrowing (final candidate) |
+| `653b03e` | 182.2 | 181.659 | 0.55 | 0 | `a3fe8e3` + `arg_types` narrowing |
+| next | | | | | + import-time attribute reads (`impattrs`): final candidate |
 
 - The practice-board leader is at **130.8**.
 - The board set is *not* the 30 sample commits. Our sample simulated time is 172.455, not
@@ -169,6 +169,31 @@ attributes (`_sql_names`, …) keep the wide fallback, because the parser reads 
 
 Container CPU on the sample: 0.35 s.
 
+### Import-time attribute reads (`impattrs`)
+
+Found by crafted edit `q8` (base `Dialect.NULL_ORDERING` "nulls_are_small" → "nulls_are_large"). It
+failed `test_snowflake.py::TestSnowflake::test_seq_functions`, which the selector left out. The DuckDB
+generator parses `_SEQ_BASE` at import with the default dialect, so the old value was baked in, and no
+test reads the attribute itself. Fix: the `--impattrs` map pass described in section 5. An edit to a
+statement in a class body whose attribute is in `impattrs` selects all tests. The same pass also
+covers Athena copying `Hive.Tokenizer.KEYWORDS` without inheriting from it, and `_sql_names`, which
+the parser reads at import.
+- Effect: it only ever widens.
+  - Sample unchanged (166.968 s).
+  - Mutants 1135.7 → 1139.7 s.
+  - `q8`, `m10` and `ns1` widen to all tests.
+- 0 misses on every set.
+- Slim image CPU on the sample: about 0.4 s.
+
+### Crafted new-kind batches (complement audits)
+
+Every test the selector left out was run on the patched tree.
+
+| Batch | Kinds | Result |
+|---|---|---|
+| `m1`–`m14` | two-file edit, move or rename a function, dispatch-table entry, optimizer `RULES` order, lazy-import `DIALECTS` list, `pretty` default, serde, fixture line, tokenizer keyword, `lru_cache` added, test helper, import-time table builder, new enum member | 0 misses |
+| `q1`–`q10` | method override added to a dialect generator, class base, property return, executor function table (2), test-body edit, dialect constant, base-dialect constant, registry key normalisation, error formatting | **`q8` missed** (fixed by `impattrs`); others 0 misses |
+
 ### Where the sample waste is
 
 Every failing sample commit is already at its floor. All the waste is in commits that break
@@ -202,15 +227,21 @@ Two extra passes cover what line coverage cannot see:
 - `--imp`: code and expression classes executed while importing sqlglot. An edit there selects all
   tests, because a failing import breaks collection everywhere, and `generators/duckdb.py` parses SQL
   templates at import.
+- `--impattrs`: class attributes read while sqlglot is imported, outside the creation of that class
+  and its subclasses, and outside class bodies copying a base's attribute. During import, a
+  `__build_class__` hook replaces each class's data attributes with recording descriptors. Example:
+  `generators/duckdb.py` parses SQL templates at import, which reads `Dialect.NULL_ORDERING` and bakes
+  the result into module state. An edit to such an attribute selects all tests.
 
 Per file the map holds `lines`, `spans`, `all`, `use`, `cuse`, `stmts`, `cstmts`, `dead`, `strs` and
 `imp`. Globals: `tests`, `sets` (fixed-width hex bitmasks), `data`, `test_files`, `attrs`, `inst`,
-`impcls`.
+`impcls`, `impattrs`.
 
 ```
 python build_maps.py <sqlglot checkout at eb11aec> <tests.json> maps.json.gz
 python build_maps.py --inst <checkout> maps.json.gz maps.json.gz
 python build_maps.py --imp  <checkout> maps.json.gz maps.json.gz
+python build_maps.py --impattrs <checkout> maps.json.gz maps.json.gz
 ```
 
 Run these in the labelling environment (`pip install -r requirements.lock coverage`).

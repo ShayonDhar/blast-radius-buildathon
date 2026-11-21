@@ -450,6 +450,110 @@ def add_import_lines(checkout, map_in, map_out):
         json.dump(d, fh, separators=(",", ":"))
 
 
+_IMPATTR_PROBE = """
+import builtins, inspect, json, os, pkgutil, sys, types, enum
+sys.path.insert(0, os.getcwd())
+root = os.getcwd() + os.sep
+reads = set()
+_CREATE = ("__new__", "__init__", "__init_subclass__")
+
+
+def _creating(owner):
+    # the read is class-creation bookkeeping (a metaclass __new__/__init__ or __init_subclass__,
+    # through any comprehension or lambda it runs): bounded by the created class's own fallbacks.
+    # Anything else (parsing, generation, module-level code) can bake the value into module state.
+    # Also a class body copying an attribute of one of its own bases (KEYWORDS = {**Base.KEYWORDS}):
+    # bounded through inheritance like any subclass.
+    f = sys._getframe(2)
+    while f is not None and f.f_code.co_name.startswith("<") and f.f_code.co_name != "<module>":
+        f = f.f_back
+    if f is None:
+        return False
+    loc = f.f_locals
+    if "__qualname__" in loc and "__module__" in loc and _bases:
+        for b in _bases[-1]:
+            try:
+                if isinstance(b, type) and issubclass(b, owner):
+                    return True
+            except TypeError:
+                pass
+        return False
+    if f.f_code.co_name not in _CREATE:
+        return False
+    return any(isinstance(v, type) for v in loc.values())
+
+
+class _Probe:
+    __slots__ = ("value", "key", "owner")
+
+    def __init__(self, value, key, owner):
+        self.value, self.key, self.owner = value, key, owner
+
+    def __get__(self, obj, objtype=None):
+        if self.key not in reads and not _creating(self.owner):
+            reads.add(self.key)
+        return self.value
+
+
+orig_build = builtins.__build_class__
+
+
+_bases = []
+
+
+def build(func, name, *bases, **kw):
+    _bases.append(bases)
+    try:
+        cls = orig_build(func, name, *bases, **kw)
+    finally:
+        _bases.pop()
+    try:
+        mod = sys.modules.get(cls.__module__)
+        f = getattr(mod, "__file__", None) or ""
+        if f.startswith(root + "sqlglot" + os.sep) and isinstance(cls, type) and not issubclass(cls, enum.Enum):
+            rel = os.path.relpath(f, root)
+            for k, v in list(vars(cls).items()):
+                if k.startswith("__") or isinstance(v, (types.FunctionType, classmethod, staticmethod, property, type)):
+                    continue
+                if hasattr(type(v), "__get__") or hasattr(type(v), "__set__"):
+                    continue
+                try:
+                    setattr(cls, k, _Probe(v, rel + "|" + cls.__qualname__ + "|" + k, cls))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return cls
+
+
+builtins.__build_class__ = build
+import sqlglot
+for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if not m.name.endswith("__main__"):
+        try:
+            __import__(m.name)
+        except Exception:
+            pass
+builtins.__build_class__ = orig_build
+json.dump(sorted(reads), sys.stdout)
+"""
+
+
+def add_import_attr_reads(checkout, map_in, map_out):
+    """Add "impattrs": class attributes ("file|Qualname|NAME") read while sqlglot is imported, outside
+    the creation of that class and its subclasses: e.g. SQL templates parsed at import read the
+    default dialect's settings (Dialect.NULL_ORDERING) and bake the result into module state that no
+    test reads the attribute for. An edit to such an attribute can change every test."""
+    out = subprocess.run([sys.executable, "-c", _IMPATTR_PROBE], cwd=checkout, capture_output=True,
+                         text=True, check=True).stdout
+    with gzip.open(map_in, "rt") as fh:
+        d = json.load(fh)
+    d["impattrs"] = json.loads(out)
+    with gzip.open(map_out, "wt", compresslevel=9) as fh:
+        json.dump(d, fh, separators=(",", ":"))
+    print(f"impattrs: {len(d['impattrs'])}", file=sys.stderr)
+
+
 def add_instantiations(checkout, map_in, map_out, jobs=4):
     """Add "inst": {"file|Qualname": set id} - the tests that instantiated each sqlglot expression
     class or a subclass of it (inst_plugin.py). Class-setup and collection work counts for every
@@ -512,6 +616,9 @@ def main():
         return
     if args and args[0] == "--reformat":
         reformat(args[1], args[2], args[3])
+        return
+    if args and args[0] == "--impattrs":  # build_maps.py --impattrs <checkout> <map in> <map out>
+        add_import_attr_reads(args[1], args[2], args[3])
         return
     if args and args[0] == "--imp":  # build_maps.py --imp <checkout> <map in> <map out>
         add_import_lines(args[1], args[2], args[3])
