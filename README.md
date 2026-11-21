@@ -193,6 +193,8 @@ Every test the selector left out was run on the patched tree.
 |---|---|---|
 | `m1`–`m14` | two-file edit, move or rename a function, dispatch-table entry, optimizer `RULES` order, lazy-import `DIALECTS` list, `pretty` default, serde, fixture line, tokenizer keyword, `lru_cache` added, test helper, import-time table builder, new enum member | 0 misses |
 | `q1`–`q10` | method override added to a dialect generator, class base, property return, executor function table (2), test-body edit, dialect constant, base-dialect constant, registry key normalisation, error formatting | **`q8` missed** (fixed by `impattrs`); others 0 misses |
+| `s1`–`s7` | module-level constants: `UNESCAPED_SEQUENCES` (merged into every dialect at import), `STRICT_TIME_FORMATS`, DuckDB `_SEQ_BASE` template, `WEEK_START_DAY_TO_DOW`, `AFTER_HAVING_MODIFIER_TRANSFORMS` lambda, `helper.DATE_UNITS`, `ASCII_LOWER`/`ASCII_UPPER` swapped | 0 misses |
+| `t1`–`t10` | Snowflake `NORMALIZATION_STRATEGY`, parser `FUNCTIONS` entry, BigQuery `TYPE_MAPPING` entry, Snowflake tokenizer keyword removed, `diff.py`, `lineage.py` walk order, `schema.normalize_name` default, planner copy, JSON-path escapes, `scope.py` condition | 0 misses (`t5`: 4 selected, 1616 left out) |
 
 ### Where the sample waste is
 
