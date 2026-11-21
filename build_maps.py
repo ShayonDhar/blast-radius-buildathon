@@ -193,8 +193,17 @@ def main():
         line_mask = {}  # file -> {line: mask}
         data_mask = {}
         use_mask = {}
+        import glob
+
+        covs = []
         for p in prefixes:
-            cd = coverage.CoverageData(basename=p + ".cov")
+            covs.append(p + ".cov")
+            covs += sorted(glob.glob(p + ".w*.cov"))
+        useds = []
+        for p in prefixes:
+            useds += sorted(glob.glob(p + ".w*.used.json"))
+        for c in covs:
+            cd = coverage.CoverageData(basename=c)
             cd.read()
             for fn in cd.measured_files():
                 rel = os.path.relpath(fn, checkout)
@@ -205,6 +214,7 @@ def main():
                         m |= cm(c)
                     if m:
                         lm[line] = lm.get(line, 0) | m
+        for p in prefixes:
             oj = json.load(open(p + ".opens.json"))
             for ctx, files in oj["opens"].items():
                 m = cm(ctx)
@@ -212,6 +222,11 @@ def main():
                     if not f.endswith((".py", ".pyc")):
                         data_mask[f] = data_mask.get(f, 0) | m
             for ctx, files in oj["used"].items():
+                m = cm(ctx)
+                for f in files:
+                    use_mask[f] = use_mask.get(f, 0) | m
+        for u in useds:
+            for ctx, files in json.load(open(u)).items():
                 m = cm(ctx)
                 for f in files:
                     use_mask[f] = use_mask.get(f, 0) | m

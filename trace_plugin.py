@@ -72,6 +72,57 @@ def _install_usage_hooks():
     D.Dialect.get_or_raise = classmethod(gor)
 
 
+def _preimport():
+    import sqlglot
+
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if m.name.endswith("__main__"):
+            continue
+        try:
+            __import__(m.name)
+        except Exception as e:  # pragma: no cover
+            print("preimport failed", m.name, e, file=sys.stderr)
+
+
+class _Tagged:
+    """Wraps a task sent to a worker process so the worker records coverage
+    under the context of the test that submitted it."""
+
+    def __init__(self, ctx, fn):
+        self.ctx, self.fn = ctx, fn
+
+    def __call__(self, *a, **k):
+        global _cov, _ctx
+        if _cov is None:
+            _preimport()
+            _install_usage_hooks()
+            _cov = coverage.Coverage(
+                data_file=f"{_OUT}.w{os.getpid()}.cov",
+                include=[os.path.join(_ROOT, "sqlglot", "*"), os.path.join(_ROOT, "tests", "*")],
+                config_file=False,
+            )
+            _cov.start()
+        _switch(self.ctx)
+        try:
+            return self.fn(*a, **k)
+        finally:
+            _switch("")
+            _cov.save()
+            with open(f"{_OUT}.w{os.getpid()}.used.json", "w") as f:
+                json.dump({k: sorted(v) for k, v in _used.items()}, f)
+
+
+def _patch_pools():
+    from concurrent.futures import ProcessPoolExecutor
+
+    orig = ProcessPoolExecutor.submit
+
+    def submit(self, fn, /, *a, **k):
+        return orig(self, _Tagged(_ctx or "", fn), *a, **k)
+
+    ProcessPoolExecutor.submit = submit
+
+
 def _audit(event, args):
     if event != "open" or _ctx is None:
         return
@@ -97,15 +148,7 @@ def pytest_configure(config):
     global _cov
     # Import every sqlglot module first so import-time lines are not charged to
     # whichever test happens to import a dialect lazily.
-    import sqlglot
-
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        if m.name.endswith("__main__"):
-            continue
-        try:
-            __import__(m.name)
-        except Exception as e:  # pragma: no cover
-            print("preimport failed", m.name, e, file=sys.stderr)
+    _preimport()
     _cov = coverage.Coverage(
         data_file=_OUT + ".cov",
         include=[os.path.join(_ROOT, "sqlglot", "*"), os.path.join(_ROOT, "tests", "*")],
@@ -113,6 +156,7 @@ def pytest_configure(config):
         branch=False,
     )
     _install_usage_hooks()
+    _patch_pools()
     _cov.start()
     sys.addaudithook(_audit)
 
