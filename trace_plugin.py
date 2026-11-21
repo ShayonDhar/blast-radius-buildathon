@@ -62,21 +62,6 @@ def _install_usage_hooks():
             return init
 
         base.__init__ = make(orig)
-    meta = type(D.Dialect)
-    for name in ("__getitem__", "get"):
-        orig = getattr(meta, name)
-
-        def make2(orig):
-            @functools.wraps(orig)
-            def f(cls, *a, **k):
-                r = orig(cls, *a, **k)
-                if isinstance(r, type):
-                    _note(r)
-                return r
-
-            return f
-
-        setattr(meta, name, make2(orig))
     orig = D.Dialect.get_or_raise.__func__
 
     def gor(cls, *a, **k):
