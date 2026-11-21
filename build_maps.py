@@ -119,19 +119,25 @@ def top_stmts(path):
             names = set()
             if outer:
                 names.add(outer)
+            # Inside a class only the outermost class name counts: its attributes
+            # (arg_types, TRANSFORMS, ...) are reached through its instances, and
+            # generic attribute names would match half the code base.
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names.add(st.name)
+                if not outer:
+                    names.add(st.name)
                 out.append((start, st.end_lineno, names))
             elif isinstance(st, ast.ClassDef):
-                names.add(st.name)
+                if not outer:
+                    names.add(st.name)
                 out.append((start, st.end_lineno, names))
                 walk(st.body, outer or st.name)
             else:
-                if isinstance(st, ast.Assign):
-                    for t in st.targets:
-                        names |= targets(t)
-                elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
-                    names |= targets(st.target)
+                if not outer:
+                    if isinstance(st, ast.Assign):
+                        for t in st.targets:
+                            names |= targets(t)
+                    elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+                        names |= targets(st.target)
                 out.append((st.lineno, st.end_lineno, names))
                 for field in ("body", "orelse", "finalbody"):
                     sub = getattr(st, field, None)

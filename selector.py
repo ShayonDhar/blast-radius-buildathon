@@ -70,23 +70,32 @@ def parse_patch(text):
 
 
 def changed_lines(f):
-    """(removed old line numbers, insertion points as (prev_old, next_old))."""
+    """(removed old line numbers, insertion points as (prev_old, next_old)).
+    A replaced line is not an insertion; extra added lines or pure additions are."""
     removed, inserts = [], []
     for start, lines in f["hunks"]:
         old = start
-        pending = False
+        grp = None  # [first old line, removed count, added count]
+
+        def flush():
+            if grp and grp[2] > 0 and (grp[1] == 0 or grp[2] > grp[1]):
+                inserts.append((grp[0] - 1, grp[0] + grp[1]))
+
         for tag, _ in lines:
             if tag == " ":
-                pending = False
+                flush()
+                grp = None
                 old += 1
-            elif tag == "-":
+                continue
+            if grp is None:
+                grp = [old, 0, 0]
+            if tag == "-":
                 removed.append(old)
+                grp[1] += 1
                 old += 1
-                pending = False
             else:
-                if not pending:
-                    inserts.append((old - 1, old))
-                    pending = True
+                grp[2] += 1
+        flush()
     return removed, inserts
 
 
