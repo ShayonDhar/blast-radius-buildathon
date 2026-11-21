@@ -221,6 +221,10 @@ class Map:
         m |= cuse if best is None or bin(cuse).count("1") <= 700 else self.mask(e["use"])
         return m
 
+    def is_dead(self, rel, line):
+        """Executable function-body line that no test ever ran."""
+        return any(a <= line <= b for a, b in self.files[rel].get("dead", ()))
+
     def in_function(self, rel, line):
         return any(a <= line <= b and k == "f" for a, b, k, _ in self.files[rel]["spans"])
 
@@ -406,6 +410,8 @@ def py_file_mask(mp, rel, f, source_old):
     m = 0
     for ln in removed:
         lm = mp.line_mask(rel, ln)
+        if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
+            continue  # never executed by any test (and not docstring text)
         if lm and mp.in_function(rel, ln):
             m |= lm
         elif lm:

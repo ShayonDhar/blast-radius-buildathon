@@ -73,6 +73,48 @@ def spans_of(path):
     return out
 
 
+def dead_ranges(path, lm):
+    """Statements inside function bodies that no test executed (header lines only for compound
+    statements; docstrings excluded). An edit confined to such lines cannot change a test."""
+    try:
+        tree = ast.parse(Path(path).read_text())
+    except Exception:
+        return []
+    out = []
+
+    def visit(body, in_func):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                visit(st.body, in_func)
+                continue
+            is_def = isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))
+            sub = getattr(st, "body", None)
+            if in_func and not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
+                first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+                last = sub[0].lineno - 1 if isinstance(sub, list) and sub else st.end_lineno
+                last = max(last, st.lineno)
+                if not any(l in lm for l in range(first, last + 1)):
+                    out.append([first, last])
+            if is_def:
+                visit(st.body, True)
+            else:
+                for field in ("body", "orelse", "finalbody"):
+                    seq = getattr(st, field, None)
+                    if isinstance(seq, list):
+                        visit(seq, in_func)
+                for h in getattr(st, "handlers", []):
+                    visit(h.body, in_func)
+
+    visit(tree.body, False)
+    merged = []
+    for a, b in sorted(out):
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
+
+
 def stmt_ranges(path):
     """(first, last) line of every statement header (compound bodies excluded)."""
     try:
@@ -499,7 +541,8 @@ def main():
                 m |= refs.get(nm, 0)
             st_out.append([a, b, sid(m)])
         files_out[rel] = {"lines": runs, "spans": spans, "all": sid(allm), "use": sid(direct | allm),
-                          "cuse": sid(um | allm), "stmts": st_out}
+                          "cuse": sid(um | allm), "stmts": st_out,
+                          "dead": dead_ranges(os.path.join(checkout, rel), lm) if lm else []}
     data_out = {f: sid(m) for f, m in sorted(data_mask.items())}
     result = {
         "tests": ids,
