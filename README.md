@@ -185,6 +185,16 @@ the parser reads at import.
 - 0 misses on every set.
 - Slim image CPU on the sample: about 0.4 s.
 
+### New module-level imports
+
+Found by crafted edit `x1`: `from sqlglot.dialects import duckdb` added at the end of `generator.py`.
+That creates an import cycle (ImportError in almost every test file) and loads a dialect eagerly
+(`test_lazy_load`). The selector skipped `import` statements when looking for new import-time code,
+so it selected 1585 tests, not all. Now a new module-level import (module level, class bodies, `if`
+and `try` blocks) of a module the file did not import before selects all tests, unless that module
+is in the standard library. `from pkg import name` counts `pkg.name` only when it is a module in the
+source tree. Effect: sample and mutants unchanged; `x1` and `u1` widen to all tests.
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.
@@ -198,6 +208,7 @@ Every test the selector left out was run on the patched tree.
 | `u1`–`u9` | new module imported by an existing one, helper signature change with some callers updated (3 files), unused function deleted, executor aggregate row order (10 selected), DuckDB typing set, test-class setup data, new public function in `sqlglot/__init__.py`, module rename + importer update (all tests) | 0 misses |
 | `v1`–`v8` | exception base class (`SchemaError(ValueError)`), verbose `__repr__`, log message text, `cached_property` on `Scope.tables`, bogus import inside `TYPE_CHECKING`, enum member order, `__slots__` entry added, tokenizer core setup copy | 0 misses |
 | `w1`–`w8` | new `NULL_ORDERING` override in BigQuery, new BigQuery `TRANSFORMS` entry, `eliminate_qualify` alias prefix (1 selected), `qualify(expand_alias_refs=)` default, `time.format_time`, test helper `validate_all`, `staticmethod` → `classmethod` in the executor (10 selected), new module global `schema` | 0 misses |
+| `x1`–`x6` | eager dialect import added at the end of `generator.py`, base typing table entry, CLI help text, new docs file (0 selected; all 1620 pass), DuckDB typing table | **`x1` missed** (fixed: new imports); others 0 misses |
 
 ### Where the sample waste is
 

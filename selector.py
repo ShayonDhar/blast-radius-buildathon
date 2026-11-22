@@ -391,10 +391,67 @@ def import_time_effects(text):
     return flags, assigned
 
 
-def adds_import_time_code(source_old, new_text):
+def _is_module(name):
+    path = os.path.join(SRC, *name.split("."))
+    return os.path.isfile(path + ".py") or os.path.isfile(os.path.join(path, "__init__.py"))
+
+
+def _module_imports(text, rel):
+    """Modules loaded by imports outside functions (module level, class bodies, if/try blocks).
+    `from pkg import name` loads pkg, and pkg.name too when that is a module in the source tree."""
+    import ast
+
+    pkg = rel[:-3].replace("/", ".").rsplit(".", 1)[0] if rel.endswith(".py") else ""
+    if rel.endswith("/__init__.py"):
+        pkg = rel[: -len("/__init__.py")].replace("/", ".")
+    out = set()
+
+    def walk(body):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(st, ast.Import):
+                out.update(a.name for a in st.names)
+            elif isinstance(st, ast.ImportFrom):
+                if st.level:
+                    base = pkg.split(".")
+                    base = base[: len(base) - (st.level - 1)] if st.level > 1 else base
+                    mod = ".".join([*base, st.module] if st.module else base)
+                else:
+                    mod = st.module or ""
+                out.add(mod)
+                for a in st.names:
+                    if _is_module(f"{mod}.{a.name}"):
+                        out.add(f"{mod}.{a.name}")
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(st, field, None)
+                if isinstance(sub, list):
+                    walk([x for x in sub if isinstance(x, ast.stmt)])
+            for h in getattr(st, "handlers", None) or ():
+                walk(h.body)
+
+    walk(ast.parse(text).body)
+    return out
+
+
+def adds_new_import(source_old, new_text, rel=""):
+    """A module-level import of a module this file did not import before, other than the standard
+    library: loading it at import time can create an import cycle, register a dialect eagerly
+    (test_lazy_load) or fail outright, so no coverage of the old code bounds it."""
+    stdlib = getattr(sys, "stdlib_module_names", ())
+    for m in _module_imports(new_text, rel) - _module_imports(source_old, rel):
+        top = m.split(".", 1)[0]
+        if top not in stdlib:
+            return True
+    return False
+
+
+def adds_import_time_code(source_old, new_text, rel=""):
     old_flags, old_assigned = import_time_effects(source_old)
     new_flags, new_assigned = import_time_effects(new_text)
     if new_flags - old_flags:
+        return True
+    if adds_new_import(source_old, new_text, rel):
         return True
     return any(n not in old_assigned and not lit for n, lit in new_assigned.items())
 
@@ -619,7 +676,7 @@ def py_file_mask(mp, rel, f, source_old):
                 removed0, inserts0 = changed_lines(f)
                 outside = any(not mp.in_function(rel, ln) for ln in removed0) or any(
                     not (mp.in_function(rel, max(a, 1)) and mp.in_function(rel, max(b, 1))) for a, b in inserts0)
-                if outside and adds_import_time_code(source_old, new_text):
+                if outside and adds_import_time_code(source_old, new_text, rel):
                     return import_breaking_mask(mp, rel)  # new code that runs when the module is imported
             except SyntaxError:
                 return import_breaking_mask(mp, rel)
