@@ -223,6 +223,26 @@ found no rule violations and no crashes. It did find 5 crafted kinds of edit tha
 Effect: every known patch (sample, mutants, all crafted and adversarial sets) selects exactly as
 before.
 
+### Optimality review
+
+- **Worker split:** LPT reaches the exact optimum on every known commit. The one 1 ms exception
+  was brute-forced to be the true optimum. The free filler never adds cost, and it sometimes
+  catches failing tests (13 of `3utz`'s 37), so it stays.
+- **Two misses fixed:**
+  - **Pickling path** (`Expr.__reduce__`, `serde.py`): the tracer does not credit a pool worker's
+    unpickling or pickling to the submitting test. An edit there now also selects every test that
+    reaches a `.submit(` line. Repro `reduce1`: 12 → 1465 selected; complement audit clean.
+  - **Package introspection:** `test_typing.py` imports every `sqlglot/typing` module itself and
+    reads their source. An edit to a module whose package a test module loads dynamically
+    (`importlib`/`pkgutil`) now adds that test module, when the selection is already non-empty.
+    Repro `typing_redundant`: complement audit clean.
+- **CPU:** each text is parsed once and the trees are shared. The docstring-only check compares
+  trees directly instead of dumping them. Sample CPU drops from ~0.75 s to ~0.4 s, with identical
+  output.
+- **Cost:** sample 166.968 → 166.980 s, mutants 1139.69 → 1139.79 s; 0 misses everywhere.
+- Narrowings tried and rejected: typing-only users (drops unaudited tests), and module-constant
+  statement users (unsound: mutant `r4x001` loses all 9 failing tests).
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.

@@ -358,17 +358,56 @@ def _literal(node):
     return False
 
 
-def _no_doc_dump(text):
-    """The module's AST with every module, class and function docstring removed."""
+_TREES = {}
+
+
+def _tree(text):
+    """ast.parse(text), parsed once per text and shared: no caller may modify the tree."""
+    t = _TREES.get(text)
+    if t is None:
+        import ast
+
+        if len(_TREES) >= 16:
+            _TREES.clear()
+        t = _TREES[text] = ast.parse(text)
+    return t
+
+
+def _same_no_doc(a, b):
+    """True when two ASTs are equal once every module, class and function docstring is removed
+    (a body holding only a docstring counts as `pass`): what comparing ast.dump of both trees with
+    docstrings stripped gives, without building the dumps."""
     import ast
 
-    tree = ast.parse(text)
-    for n in ast.walk(tree):
-        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
-            first = n.body[0]
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    pass_ = [ast.Pass()]
+
+    def body(n):
+        b = n.body
+        if b:
+            first = b[0]
             if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-                n.body = n.body[1:] or [ast.Pass()]
-    return ast.dump(tree)
+                return b[1:] or pass_
+        return b
+
+    def same(x, y):
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, ast.AST):
+            doc = isinstance(x, owners)
+            for f in x._fields:
+                if doc and f == "body":
+                    u, v = body(x), body(y)
+                else:
+                    u, v = getattr(x, f, None), getattr(y, f, None)
+                if not same(u, v):
+                    return False
+            return True
+        if isinstance(x, list):
+            return len(x) == len(y) and all(same(u, v) for u, v in zip(x, y))
+        return x is y or repr(x) == repr(y)
+
+    return same(a, b)
 
 
 def import_time_effects(text):
@@ -400,7 +439,7 @@ def import_time_effects(text):
                     if isinstance(sub, list):
                         walk(sub)
 
-    walk(ast.parse(text).body)
+    walk(_tree(text).body)
     return flags, assigned
 
 
@@ -443,7 +482,7 @@ def _module_imports(text, rel):
             for h in getattr(st, "handlers", None) or ():
                 walk(h.body)
 
-    walk(ast.parse(text).body)
+    walk(_tree(text).body)
     return out
 
 
@@ -484,7 +523,7 @@ def _top_names(text):
             for h in getattr(st, "handlers", None) or ():
                 walk(h.body)
 
-    walk(ast.parse(text).body)
+    walk(_tree(text).body)
     return out
 
 
@@ -560,7 +599,7 @@ def _func_bodies(text):
     import ast
 
     try:
-        tree = ast.parse(text)
+        tree = _tree(text)
     except SyntaxError:
         return None
     return [(n.body[0].lineno, n.end_lineno) for n in ast.walk(tree)
@@ -575,7 +614,7 @@ def _class_spans(text):
     import ast
 
     try:
-        tree = ast.parse(text)
+        tree = _tree(text)
     except SyntaxError:
         return None
     out = []
@@ -621,7 +660,7 @@ def class_level_owners(rel, lines, source_old):
 
         spans, funcs = _class_spans(source_old) or [], []
         try:
-            for n in ast.walk(ast.parse(source_old or "")):
+            for n in ast.walk(_tree(source_old or "")):
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                     first = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
                     funcs.append((first, n.end_lineno))
@@ -654,7 +693,7 @@ def _arg_types_lines(rel, source_old):
 
         out = set()
         try:
-            tree = ast.parse(source_old or "")
+            tree = _tree(source_old or "")
         except SyntaxError:
             tree = None
         for node in ast.walk(tree) if tree is not None else ():
@@ -731,7 +770,7 @@ def _class_stmts(rel, source_old):
                     visit(ch, prefix)
 
         try:
-            visit(ast.parse(source_old or ""), "")
+            visit(_tree(source_old or ""), "")
         except SyntaxError:
             pass
         _cstmt_cache[key] = out
@@ -748,6 +787,108 @@ def import_read_attr(mp, rel, lines, source_old):
         if any(ln and a <= ln <= b for ln in lines) and any(rel + "|" + q + "|" + n in mp.impattrs for n in names):
             return True
     return False
+
+
+PICKLE_FUNCS = ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__", "__getnewargs__",
+                "__getnewargs_ex__")
+
+
+def _pickle_lines(rel, source_old):
+    """Lines of functions that pickling runs (serde.py, __reduce__ and friends)."""
+    import ast
+
+    if rel == "sqlglot/serde.py":
+        return None  # the whole module
+    out = []
+    if not any(name in (source_old or "") for name in PICKLE_FUNCS):
+        return out
+    try:
+        for n in ast.walk(_tree(source_old or "")):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in PICKLE_FUNCS:
+                first = min([n.lineno] + [d.lineno for d in n.decorator_list])
+                out.append((first, n.end_lineno))
+    except SyntaxError:
+        return None
+    return out
+
+
+_POOL = []
+
+
+def pool_mask(mp):
+    """Tests that sent work to a process pool (a `.submit(` line in a test module). The build-time
+    tracer records a worker's coverage only while the submitted function runs, not while the worker
+    unpickles its arguments or pickles its result (serde.load / Expr.__reduce__ / serde.dump), so
+    those lines miss these tests."""
+    if _POOL:
+        return _POOL[0]
+    m = 0
+    for rel in sorted(mp.test_files):
+        if rel not in mp.files:
+            continue
+        try:
+            with open(os.path.join(SRC, rel), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if ".submit(" not in text:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if ".submit(" in line:
+                m |= mp.line_mask(rel, i)
+    _POOL.append(m)
+    return m
+
+
+def pickle_path_mask(mp, rel, f, source_old):
+    if not rel.startswith("sqlglot/"):
+        return 0
+    removed, inserts = changed_lines(f)
+    touched = list(removed) + [x for p in inserts for x in p]
+    pl = _pickle_lines(rel, source_old)
+    if pl is None and rel != "sqlglot/serde.py":
+        return 0
+    if pl is None or any(a <= ln <= b for ln in touched for a, b in pl):
+        return pool_mask(mp)
+    added = [c for _, ls in f["hunks"] for t, c in ls if t == "+"]
+    if any(name in c for c in added for name in PICKLE_FUNCS):
+        return pool_mask(mp)  # a new pickling hook
+    return 0
+
+
+_INTRO = {}
+
+
+def introspect_mask(mp, rel):
+    """Test modules that load every module of rel's package themselves (importlib / pkgutil) and
+    compare their tables or read their source (test_typing.py checks sqlglot/typing/*.py for
+    redundant EXPRESSION_METADATA entries). Neither coverage nor the data-file map sees that: the
+    modules are already imported and .py reads are not recorded."""
+    if not rel.startswith("sqlglot/") or not rel.endswith(".py"):
+        return 0
+    pkg = ".".join(rel[:-3].split("/")[:-1])
+    if pkg in _INTRO:
+        return _INTRO[pkg]
+    import re
+
+    if None not in _INTRO:  # test modules that load modules dynamically, read once
+        dyn = []
+        for t in sorted(mp.test_files):
+            try:
+                with open(os.path.join(SRC, t), encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if "importlib" in text or "pkgutil" in text:
+                dyn.append((t, text))
+        _INTRO[None] = dyn
+    pat = re.compile(re.escape(pkg) + r"(?![\w])")
+    m = 0
+    for t, text in _INTRO[None]:
+        if pat.search(text):
+            m |= mp.mask(mp.test_files[t])
+    _INTRO[pkg] = m
+    return m
 
 
 def py_file_mask(mp, rel, f, source_old):
@@ -792,7 +933,7 @@ def py_file_mask(mp, rel, f, source_old):
                 touches_comment = any("#" in c for _, ls in f["hunks"] for t, c in ls if t != " ")
                 if touches_comment and code_tokens(new_text) == code_tokens(source_old):
                     return 0  # comments / blank lines only
-                if _no_doc_dump(new_text) == _no_doc_dump(source_old):
+                if _same_no_doc(_tree(new_text), _tree(source_old)):
                     return 0  # docstrings (and layout) only: no test reads them, doctests are not scored
             except Exception:
                 pass
@@ -877,7 +1018,8 @@ def py_file_mask(mp, rel, f, source_old):
                 m |= mp.nonfunc_mask(rel, max(prev, 1)) | mp.nonfunc_mask(rel, max(nxt, 1))
             else:
                 m |= nm
-    return m
+    # not gated on m: a line only a pool worker runs is recorded under no test, so it looks dead
+    return m | pickle_path_mask(mp, rel, f, source_old) | (introspect_mask(mp, rel) if m else 0)
 
 
 NARROW = True
