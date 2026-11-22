@@ -267,6 +267,38 @@ package-introspection rule. The rest are fixed by general rules, and the harmles
 Effect: every known patch selects exactly as before (sample 166.980 s, mutants 1139.8 s). Sample
 CPU is about 0.47 s.
 
+### Adversarial review (`E01`–`E21`) and the import probe
+
+14 of 15 adversarial edits were missed on `8e83955`. Nearly all were existing statements edited so
+that they raise while the module is imported:
+- `exp.Creates` typo in a class-level set
+- a DuckDB SQL template string that no longer parses
+- a name used before it is bound
+- a name imported from the wrong module
+- `@abc.abstractmethd`
+- an annotation typo in a module without future annotations
+- a removed `from __future__ import annotations`
+
+Static rules kept missing new variants, so the selector now tests imports directly.
+- **Import probe:** when a commit touches a sqlglot line outside every function body (module level,
+  class bodies, decorators, `def`/`class` headers), the selector does three things:
+  1. writes the patched files into a symlink copy of `sqlglot/` in `/tmp`;
+  2. imports every sqlglot module in a child process (`python -I -S`), using the image's
+     precompiled bytecode (the Dockerfile now runs `compileall` on `/app/src/sqlglot`);
+  3. compares the failing modules with the unpatched tree, and checks that `import sqlglot` loads no
+     dialect (`test_lazy_load`).
+
+  Any new failure selects all tests. Edits that change only comments, docstrings, or number/boolean
+  literals in place skip the probe. About 0.25 s of CPU per probed commit. No practice commit is
+  probed: their import-time edits are number/boolean flips.
+- **Lambda lines** (`E08`): a class-level line holding a lambda keeps only the lambda's coverage when
+  the line is identical up to `lambda`. Otherwise it also gets the class-level fallback.
+- Effect: 0 misses among the adversarial edits. The harmless controls stay narrow.
+- Cost: sample 166.98 → 167.46 s; mutants 1139.8 → 1170.5 s, all from the lambda rule. Container CPU
+  on the sample is about 0.7 s.
+- False positives noted by the review (new import of an already-loaded module, a new module-level
+  `re.compile`, a new class attribute set) still select all tests.
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.

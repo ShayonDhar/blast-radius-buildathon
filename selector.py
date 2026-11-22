@@ -1020,9 +1020,14 @@ def _literal_only(f):
             return None
         return out
 
-    a = toks([c for _, ls in f["hunks"] for t, c in ls if t == "-"])
-    b = toks([c for _, ls in f["hunks"] for t, c in ls if t == "+"])
-    return a is not None and a == b
+    groups = _replacement_groups(f)
+    if not groups:
+        return False
+    for olds, news in groups:
+        a, b = toks(olds), toks(news)
+        if a is None or a != b:
+            return False
+    return True
 
 
 _DEFINED = []
@@ -1073,6 +1078,55 @@ def references_undefined(source_old, new_text, f):
             if n.attr not in defined:
                 return True
     return False
+
+
+def _replacement_groups(f):
+    """[(removed lines, added lines)] per contiguous change; None when some change is a pure
+    removal or a pure addition (a moved or new statement is never "literal-only")."""
+    out = []
+    for _, lines in f["hunks"]:
+        olds, news = [], []
+        for tag, c in lines + [(" ", "")]:
+            if tag == "-":
+                olds.append(c)
+            elif tag == "+":
+                news.append(c)
+            elif olds or news:
+                if not olds or not news:
+                    return None
+                out.append((olds, news))
+                olds, news = [], []
+    return out
+
+
+def _scalar_literal_only(f):
+    """The removed and added lines differ only in number tokens and True/False/None."""
+    import io
+    import tokenize
+
+    def toks(lines):
+        out = []
+        try:
+            src = "".join(l.strip() + "\n" for l in lines)
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                if tok.type in (tokenize.NUMBER, tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                                tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+                    continue
+                if tok.type == tokenize.NAME and tok.string in ("True", "False", "None"):
+                    continue
+                out.append(tok.string)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
+        return out
+
+    groups = _replacement_groups(f)
+    if not groups:
+        return False
+    for olds, news in groups:
+        a, b = toks(olds), toks(news)
+        if a is None or a != b:
+            return False
+    return True
 
 
 def class_level_code_change(mp, f, source_old=None, new_text=None):
@@ -1235,6 +1289,34 @@ def memo_caller_mask(mp, rel, lines, source_old):
     return m
 
 
+def _lambda_body_edits(f, removed):
+    """Old line numbers whose replacement keeps the line identical up to its `lambda`, so the edit is
+    confined to the lambda (its parameters or body), which the line's coverage does bound."""
+    out = set()
+    olds, news = [], []
+    for _, lines in f["hunks"]:
+        for tag, c in lines + [(" ", "")]:
+            if tag == "-":
+                olds.append(c)
+            elif tag == "+":
+                news.append(c)
+            else:
+                if len(olds) == len(news):
+                    for o, n in zip(olds, news):
+                        if "lambda" in o and "lambda" in n and o[: o.index("lambda")] == n[: n.index("lambda")]:
+                            out.add(o)
+                olds, news = [], []
+    texts = {}
+    i = 0
+    for _, lines in f["hunks"]:
+        for tag, c in lines:
+            if tag == "-":
+                if i < len(removed):
+                    texts[removed[i]] = c
+                i += 1
+    return {ln for ln, c in texts.items() if c in out}
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -1329,6 +1411,7 @@ def py_file_mask(mp, rel, f, source_old):
         # class attributes (arg_types, ...) are consumed when the class is created: every test that
         # instantiated the class or a subclass can see the change
         m |= class_level_inst(mp, rel, list(removed) + [x for p in inserts for x in p], source_old)
+    lambda_only = _lambda_body_edits(f, removed)
     for ln in removed:
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
@@ -1344,6 +1427,8 @@ def py_file_mask(mp, rel, f, source_old):
             m |= lm
         elif lm:
             m |= lm | mp.stmt_refs(rel, ln)  # class-level line that also runs in tests (lambda entries)
+            if ln not in lambda_only:
+                m |= mp.span_mask(rel, ln)  # the edit is outside the lambda body (its key, its target)
         else:
             nm = expr_class_narrow(mp, rel, [ln], source_old)
             m |= mp.span_mask(rel, ln) if nm is None else nm
@@ -1631,6 +1716,166 @@ def verify_commit(stem, files, chosen, ms, idof):
     return sorted(bad)
 
 
+# ---- import probe ---------------------------------------------------------------------------
+# A line that runs while a module is imported (module level, class bodies, decorators, def/class
+# headers) can make that import raise: a typo in an attribute, a SQL template that no longer
+# parses, a name used before it is bound, a name imported from the wrong module. No map can bound
+# that, so import every sqlglot module from a copy of the tree with the patch applied, in a child
+# process, and compare the modules that fail with the unpatched tree.
+IMPORT_PROBE = os.environ.get("BR_IMPORT_PROBE", "1") == "1"
+_PROBE_CODE = r"""
+import importlib, pkgutil, sys
+sys.path.insert(0, sys.argv[1])
+import sqlglot
+from sqlglot.dialects.dialect import Dialect
+bad = []
+if len(Dialect._classes) != 1:
+    bad.append("<lazy>")
+for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if info.name == "sqlglot.__main__":
+        continue
+    try:
+        importlib.import_module(info.name)
+    except BaseException:
+        bad.append(info.name)
+print("\n".join(sorted(bad)))
+print("<END>")
+"""
+_PROBE_BASE = []
+_probe_seq = [0]
+
+
+def _run_probe(root):
+    """Modules that fail to import from `root` (plus "<lazy>"), or None if the probe itself failed."""
+    import subprocess
+
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONHASHSEED": "0"}
+    try:
+        p = subprocess.run([sys.executable, "-I", "-S", "-c", _PROBE_CODE, root], capture_output=True, text=True,
+                           timeout=60, env=env, cwd="/tmp")
+    except Exception:
+        return None
+    lines = p.stdout.splitlines()
+    if p.returncode != 0 or not lines or lines[-1] != "<END>":
+        return None
+    return {l for l in lines[:-1] if l}
+
+
+def _overlay(patched):
+    """A copy of sqlglot/ in /tmp: symlinks to the pinned tree (bytecode included) with the patched
+    files written as real files."""
+    import shutil
+    import tempfile
+
+    _probe_seq[0] += 1
+    ov = tempfile.mkdtemp(prefix=f"brp{_probe_seq[0]}_", dir="/tmp")
+    real = {"sqlglot"}
+    for rel in patched:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            real.add("/".join(parts[:i]))
+
+    def mirror(rd):
+        os.makedirs(os.path.join(ov, rd), exist_ok=True)
+        for name in os.listdir(os.path.join(SRC, rd)):
+            rel = f"{rd}/{name}"
+            if rel in patched:
+                continue
+            src = os.path.join(SRC, rel)
+            if rel in real and os.path.isdir(src):
+                mirror(rel)
+            else:
+                os.symlink(src, os.path.join(ov, rel))
+
+    try:
+        mirror("sqlglot")
+        for rel, text in patched.items():
+            if text is None:
+                continue
+            path = os.path.join(ov, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+    except Exception:
+        shutil.rmtree(ov, ignore_errors=True)
+        raise
+    return ov
+
+
+def import_time_files(files):
+    """The commit's sqlglot .py files whose patch touches a line outside every function body."""
+    out = []
+    for f in files:
+        rel = f["new"]
+        if f["binary"] or not rel.startswith("sqlglot/") or not rel.endswith(".py"):
+            continue
+        if f["new_file"] or f["deleted"] or f["old"] != rel:
+            out.append(f)
+            continue
+        try:
+            with open(os.path.join(SRC, f["old"]), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        try:
+            new_text = apply_patch(text, f)
+            if code_tokens(new_text) == code_tokens(text) or _same_no_doc(_tree(new_text), _tree(text)):
+                continue  # comments or docstrings only: imports cannot change
+            if _scalar_literal_only(f):
+                continue  # only numbers / True / False / None changed: nothing new can raise
+        except Exception:
+            pass
+        bodies = _cached(("bodies", rel), lambda: _func_bodies(text)) or []
+
+        def inb(n):
+            return any(a <= n <= b for a, b in bodies)
+
+        removed, inserts = changed_lines(f)
+        if any(not inb(ln) for ln in removed) or any(not (inb(max(a, 1)) and inb(max(b, 1))) for a, b in inserts):
+            out.append(f)
+    return out
+
+
+def import_probe_breaks(files):
+    """True when applying the commit makes some sqlglot module fail to import (or loads a dialect
+    eagerly); False when imports behave as on the pinned tree or the probe cannot run."""
+    import shutil
+
+    patched = {}
+    for f in files:
+        rel = f["new"]
+        if not rel.startswith("sqlglot/") or not rel.endswith(".py") or f["binary"]:
+            continue
+        if f["deleted"] or f["old"] != rel:
+            return False  # handled by the static rules (all tests)
+        base = os.path.join(SRC, f["old"])
+        old = ""
+        if not f["new_file"]:
+            try:
+                with open(base, encoding="utf-8") as fh:
+                    old = fh.read()
+            except OSError:
+                return False
+        try:
+            patched[rel] = apply_patch(old, f)
+        except Exception:
+            return False
+    if not patched:
+        return False
+    if not _PROBE_BASE:
+        _PROBE_BASE.append(_run_probe(SRC))
+    base = _PROBE_BASE[0]
+    if base is None:
+        return False
+    ov = _overlay(patched)
+    try:
+        got = _run_probe(ov)
+    finally:
+        shutil.rmtree(ov, ignore_errors=True)
+    return got is None or bool(got - base)
+
+
 def main():
     with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as fh:
         tests = json.load(fh)["tests"]
@@ -1660,6 +1905,12 @@ def main():
                 m, wide = select(mp, files, None)
             if m != mp.all_mask():
                 m = prune_giants(mp, files, m)
+            if IMPORT_PROBE and m != mp.all_mask() and import_time_files(files):
+                try:
+                    if import_probe_breaks(files):
+                        m = mp.all_mask()
+                except Exception as e:
+                    print(f"{stem}: probe {e!r}", file=sys.stderr)
         except Exception as e:  # never crash: fall back to everything
             print(f"{stem}: {e!r}", file=sys.stderr)
             m, wide = mp.all_mask(), 0
