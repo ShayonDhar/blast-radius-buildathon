@@ -891,6 +891,350 @@ def introspect_mask(mp, rel):
     return m
 
 
+_CACHE = {}
+
+
+def _cached(key, fn):
+    """Per-run cache for facts about the pinned (old) source of a file."""
+    if key not in _CACHE:
+        _CACHE[key] = fn()
+    return _CACHE[key]
+
+
+_MODULE_DUNDERS = {"__name__", "__file__", "__doc__", "__spec__", "__package__", "__loader__", "__path__",
+                   "__builtins__", "__annotations__", "__dict__", "__qualname__", "__module__", "__class__"}
+
+
+def _bindings(body):
+    """[(line, name)] bound by statements in `body` (imports, defs, classes, assignments), recursing
+    into if/try/with/for blocks but not into defs or classes. "*" marks a star import."""
+    import ast
+
+    out = []
+    for st in body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.append((st.lineno, st.name))
+            continue
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            for a in st.names:
+                out.append((st.lineno, "*" if a.name == "*" else (a.asname or a.name).split(".", 1)[0]))
+        else:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    out.append((st.lineno, n.id))
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    break
+        for field in ("body", "orelse", "finalbody"):
+            sub = getattr(st, field, None)
+            if isinstance(sub, list) and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.extend(_bindings(sub))
+        for h in getattr(st, "handlers", None) or ():
+            if getattr(h, "name", None):
+                out.append((h.lineno, h.name))
+            out.extend(_bindings(h.body))
+    return out
+
+
+def def_time_unbound(text):
+    """{(def qualname, name)}: names that a module- or class-level def's decorators, default values or
+    evaluated annotations use but that nothing binds before the def (builtins aside). Those are
+    evaluated when the def statement runs, i.e. at import: an unbound one raises NameError there."""
+    import ast
+    import builtins
+
+    tree = _tree(text)
+    lazy_ann = any(isinstance(st, ast.ImportFrom) and st.module == "__future__" and
+                   any(a.name == "annotations" for a in st.names) for st in tree.body)
+    known = set(dir(builtins)) | _MODULE_DUNDERS
+    mod_binds = _bindings(tree.body)
+    if any(n == "*" for _, n in mod_binds):
+        return set()
+    out = set()
+
+    def exprs(fn):
+        a = fn.args
+        es = list(fn.decorator_list) + list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+        if not lazy_ann:
+            for arg in a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]:
+                if arg.annotation is not None:
+                    es.append(arg.annotation)
+            if fn.returns is not None:
+                es.append(fn.returns)
+        return es
+
+    def names(e):
+        stack = [e]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Lambda):
+                stack.extend(n.args.defaults)
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                yield n.id
+            stack.extend(ast.iter_child_nodes(n))
+
+    def visit(body, prefix, scope_binds, class_line):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                line = min([st.lineno] + [d.lineno for d in st.decorator_list])
+                bound = {n for ln, n in scope_binds if ln < line}
+                if class_line is not None:
+                    bound |= {n for ln, n in mod_binds if ln < class_line}
+                for e in exprs(st):
+                    for nm in names(e):
+                        if nm not in bound and nm not in known:
+                            out.add((prefix + st.name, nm))
+            elif isinstance(st, ast.ClassDef):
+                visit(st.body, prefix + st.name + ".", _bindings(st.body),
+                      st.lineno if class_line is None else class_line)
+            else:
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list):
+                        visit(sub, prefix, scope_binds, class_line)
+                for h in getattr(st, "handlers", None) or ():
+                    visit(h.body, prefix, scope_binds, class_line)
+
+    visit(tree.body, "", mod_binds, None)
+    return out
+
+
+def _literal_only(f):
+    """True when the removed and added lines differ only in literal tokens (strings, numbers,
+    True/False/None) and comments."""
+    import io
+    import tokenize
+
+    skip = {tokenize.STRING, tokenize.NUMBER, tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+            tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}
+
+    def toks(lines):
+        out = []
+        try:
+            src = "".join(l.strip() + "\n" for l in lines)
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                if tok.type in skip or (tok.type == tokenize.NAME and tok.string in ("True", "False", "None")):
+                    continue
+                out.append(tok.string)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
+        return out
+
+    a = toks([c for _, ls in f["hunks"] for t, c in ls if t == "-"])
+    b = toks([c for _, ls in f["hunks"] for t, c in ls if t == "+"])
+    return a is not None and a == b
+
+
+_DEFINED = []
+
+
+def _defined_names():
+    """Every name the pinned sqlglot sources define (classes, functions, assignments, enum members)."""
+    if not _DEFINED:
+        import re
+
+        pat = re.compile(r"^\s*(?:class|def|async def)\s+(\w+)|^\s*(\w+)\s*(?::[^=\n]*)?=(?!=)", re.M)
+        names = set()
+        for dirpath, _, fnames in os.walk(os.path.join(SRC, "sqlglot")):
+            for fn in fnames:
+                if fn.endswith(".py"):
+                    try:
+                        with open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace") as fh:
+                            for a, b in pat.findall(fh.read()):
+                                names.add(a or b)
+                    except OSError:
+                        pass
+        _DEFINED.append(names)
+    return _DEFINED[0]
+
+
+def references_undefined(source_old, new_text, f):
+    """An added line reads `alias.Name` where alias is imported from sqlglot (exp, TokenType, ...)
+    and nothing in the pinned sources defines Name: in a class body or at module level that raises
+    AttributeError when the module is imported (exp.ArrayUniq in a TRANSFORMS dict)."""
+    import ast
+
+    added = _added_new_lines(f)
+    if not added:
+        return False
+    tree = _tree(new_text)
+    aliases = set()
+    for st in ast.walk(tree):
+        if isinstance(st, ast.ImportFrom) and (st.module or "").startswith("sqlglot"):
+            aliases.update(a.asname or a.name for a in st.names)
+        elif isinstance(st, ast.Import):
+            aliases.update((a.asname or a.name).split(".", 1)[0] for a in st.names if a.name.startswith("sqlglot"))
+    defined = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and getattr(n, "lineno", None) in added and isinstance(n.value, ast.Name) \
+                and n.value.id in aliases:
+            if defined is None:
+                defined = _defined_names()
+            if n.attr not in defined:
+                return True
+    return False
+
+
+def class_level_code_change(mp, f, source_old=None, new_text=None):
+    """A change outside every function body that can break the module's import: it reads an
+    attribute of a sqlglot import that the pinned sources never define."""
+    key = f["old"]
+    if key not in mp.files or not key.endswith(".py"):
+        return True
+    removed, inserts = changed_lines(f)
+    outside = any(not mp.in_function(key, ln) for ln in removed) or any(
+        not (mp.in_function(key, max(a, 1)) and mp.in_function(key, max(b, 1))) for a, b in inserts)
+    if not outside or _literal_only(f):
+        return False
+    if source_old is None:
+        try:
+            with open(os.path.join(SRC, key), encoding="utf-8") as fh:
+                source_old = fh.read()
+            new_text = apply_patch(source_old, f)
+        except Exception:
+            return True
+    try:
+        return references_undefined(source_old, new_text, f)
+    except Exception:
+        return True
+
+
+_MUTATORS = {"add", "update", "append", "extend", "insert", "setdefault", "pop", "popitem", "remove",
+             "discard", "clear", "intersection_update", "difference_update", "symmetric_difference_update"}
+
+
+def _added_new_lines(f):
+    """Line numbers, in the new file, of the patch's added lines."""
+    out = set()
+    delta = 0
+    for start, lines in f["hunks"]:
+        new = start + delta
+        for tag, _ in lines:
+            if tag == "+":
+                out.add(new)
+                new += 1
+                delta += 1
+            elif tag == "-":
+                delta -= 1
+            else:
+                new += 1
+    return out
+
+
+_MUT_RE = None
+
+
+def mutates_shared_state(source_old, new_text, f):
+    """An added line, inside a function, that mutates in place a module- or class-level container:
+    `X |= ...`, `X.add(...)`, `X[k] = ...` where X is a module-level name, an attribute reached from
+    one (exp.DataType.TEMPORAL_TYPES) or from `cls`, or a local alias of such a value. Later tests in
+    the same process see the change, so coverage of the edited lines does not bound it."""
+    import ast
+
+    global _MUT_RE
+    import re
+
+    if _MUT_RE is None:
+        _MUT_RE = re.compile(r"(\|=|&=|\^=|-=|\+=|\]\s*=[^=]|\.(?:" + "|".join(sorted(_MUTATORS)) + r")\s*\()")
+    if not any(_MUT_RE.search(c) for _, ls in f["hunks"] for t, c in ls if t == "+"):
+        return False
+    added = _added_new_lines(f)
+    if not added:
+        return False
+    tree = _tree(new_text)
+    mod = {n for _, n in _bindings(tree.body)}
+
+    def rooted(e, aliases):
+        while isinstance(e, (ast.Attribute, ast.Subscript)):
+            e = e.value
+        return isinstance(e, ast.Name) and (e.id in mod or e.id in aliases or e.id == "cls")
+
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(fn.lineno <= ln <= fn.end_lineno for ln in added):
+            continue
+        aliases = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                v = n.value
+                if isinstance(v, ast.Attribute) and rooted(v, set()):
+                    aliases.add(n.targets[0].id)
+        local = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+        for n in ast.walk(fn):
+            ln = getattr(n, "lineno", None)
+            if ln not in added:
+                continue
+            tgt = None
+            if isinstance(n, ast.AugAssign):
+                tgt = n.target
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _MUTATORS:
+                tgt = n.func.value
+            elif isinstance(n, ast.Assign):
+                for tg in n.targets:
+                    if isinstance(tg, ast.Subscript):
+                        tgt = tg.value
+            if tgt is None:
+                continue
+            if isinstance(tgt, ast.Name):
+                if tgt.id in aliases or (tgt.id in mod and tgt.id not in local and isinstance(n, (ast.Call, ast.Assign))):
+                    return True
+            elif isinstance(tgt, (ast.Attribute, ast.Subscript)):
+                base = tgt
+                while isinstance(base, (ast.Attribute, ast.Subscript)):
+                    base = base.value
+                if isinstance(base, ast.Name) and base.id != "self" and base.id not in local - {"cls"} and (
+                        base.id in mod or base.id in aliases or base.id == "cls"):
+                    return True
+    return False
+
+
+def _memo_index(source_old):
+    """(functions [(start, end, name, cached)], callers {name: [(call line, memoising caller)]})."""
+    import ast
+
+    tree = _tree(source_old)
+    mod = {n for _, n in _bindings(tree.body)}
+    funcs, callers = [], {}
+    for g in ast.walk(tree):
+        if not isinstance(g, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        cached = any((isinstance(d, ast.Name) and d.id in ("cache", "lru_cache")) or
+                     (isinstance(d, ast.Attribute) and d.attr in ("cache", "lru_cache")) or
+                     (isinstance(d, ast.Call) and getattr(d.func, "attr", getattr(d.func, "id", "")) in ("cache", "lru_cache"))
+                     for d in g.decorator_list)
+        funcs.append((g.lineno, g.end_lineno, g.name, cached))
+        stores = False
+        calls = []
+        for n in ast.walk(g):
+            if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and isinstance(n.value, ast.Name) \
+                    and n.value.id in mod:
+                stores = True
+            elif isinstance(n, ast.Call):
+                name = n.func.id if isinstance(n.func, ast.Name) else n.func.attr if isinstance(n.func, ast.Attribute) else None
+                if name:
+                    calls.append((name, n.lineno))
+        for name, ln in calls:
+            if name != g.name:
+                callers.setdefault(name, []).append((ln, stores))
+    return funcs, callers
+
+
+def memo_caller_mask(mp, rel, lines, source_old):
+    """Callers' spans for an edited function whose result is memoised: called from a function that
+    stores into a module-level container (`_DISPATCH_CACHE[cls] = _build_dispatch(cls)`) or decorated
+    with lru_cache/cache. Its body then runs once per process, so the map credits it only to the
+    tests that happened to fill the cache."""
+    funcs, callers = _cached(("memo", rel), lambda: _memo_index(source_old))
+    m = 0
+    for a, b, name, cached in funcs:
+        if any(a <= ln <= b for ln in lines):
+            for ln, stores in callers.get(name, ()):
+                if cached or stores:
+                    m |= mp.span_mask(rel, ln)
+    return m
+
+
 def py_file_mask(mp, rel, f, source_old):
     """Tests a change to one mapped python file can break."""
     if f["deleted"] or f["new_file"] or f["binary"] or rel != f["new"]:
@@ -916,6 +1260,10 @@ def py_file_mask(mp, rel, f, source_old):
                     not (mp.in_function(rel, max(a, 1)) and mp.in_function(rel, max(b, 1))) for a, b in inserts0)
                 if outside and adds_import_time_code(source_old, new_text, rel):
                     return import_breaking_mask(mp, rel)  # new code that runs when the module is imported
+                if def_time_unbound(new_text) - _cached(("dtu", rel), lambda: def_time_unbound(source_old)):
+                    return import_breaking_mask(mp, rel)  # a def's decorator/default/annotation is unbound
+                if rel.startswith("sqlglot/") and mutates_shared_state(source_old, new_text, f):
+                    return mp.all_mask()  # shared state mutated in place: later tests in a process see it
                 if removes_imported_name(rel, source_old, new_text):
                     return import_breaking_mask(mp, rel)  # an importer of a removed name fails to import
             except SyntaxError:
@@ -971,6 +1319,12 @@ def py_file_mask(mp, rel, f, source_old):
     if rel.startswith("sqlglot/") and import_read_attr(mp, rel, list(removed) + [x for p in inserts for x in p],
                                                        source_old):
         return mp.all_mask()
+    if rel.startswith("sqlglot/") and source_old is not None:
+        try:
+            m |= memo_caller_mask(mp, rel, [ln for ln in list(removed) + [x for p in inserts for x in p] if ln],
+                                  source_old)
+        except Exception:
+            pass
     if rel.startswith("sqlglot/") and INST:
         # class attributes (arg_types, ...) are consumed when the class is created: every test that
         # instantiated the class or a subclass can see the change
@@ -978,6 +1332,8 @@ def py_file_mask(mp, rel, f, source_old):
     for ln in removed:
         lm = mp.line_mask(rel, ln)
         if not lm and mp.is_dead(rel, ln) and not any(a <= ln <= b for a, b in mp.files[rel]["strs"]):
+            if tbody is not None:
+                m |= twide  # test modules: code only a pool worker runs (initializer) is never traced
             continue  # never executed by any test (and not docstring text)
         if not mp.in_function(rel, ln):
             am = mp.attr_mask(rel, ln)
@@ -1059,6 +1415,9 @@ def prune_giants(mp, files, m):
                     ok = False
                 elif not p.endswith(".py") and not p.startswith("tests/fixtures/"):
                     ok = False
+        if ok and paths and tid.endswith("test_generator_memory") and any(
+                class_level_code_change(mp, f) for f in files):
+            ok = False  # it instantiates every dialect: a class-body edit can break one at import
         if ok and paths:
             direct = 0
             for f in files:

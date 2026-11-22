@@ -243,6 +243,30 @@ before.
 - Narrowings tried and rejected: typing-only users (drops unaudited tests), and module-constant
   statement users (unsound: mutant `r4x001` loses all 9 failing tests).
 
+### Hole-hunting review (`B1`–`B21`)
+
+20 crafted edits found 10 misses on `3e12460`. `B6` and `B7` were already fixed by the
+package-introspection rule. The rest are fixed by general rules, and the harmless controls
+(`B20`, `B21`) stay narrow:
+- **Evaluated when a `def` runs** (`B8` annotation, `B13` default, `B19` decorator): for module- and
+  class-level defs, every name used by a new or changed decorator, default or evaluated annotation
+  must be a builtin or bound above the def. Otherwise all tests are selected.
+- **Memoised builders** (`B1`, `_build_dispatch` behind `_DISPATCH_CACHE`): an edit to a function
+  whose caller stores into a module-level container, or that is `lru_cache`/`cache` decorated, also
+  selects the callers' spans.
+- **In-place mutation of shared state** (`B18`, `exp.DataType.TEMPORAL_TYPES |= ...` through an
+  alias): an added line that mutates a module- or class-level container selects all tests.
+- **Dead lines in test modules** (`B5`, a pool `initializer` that is never traced): in `tests/`, a
+  line no test ran selects the file's tests and importers.
+- **`test_generator_memory` pruning** (`B9`, `B16`, `exp.ArrayUniq` in a dialect table): it is
+  kept when a class-level edit reads an attribute of a sqlglot import that the pinned sources never
+  define.
+- **Residual:** `B3` (`Dialect._try_load` name matching) fails only after another test clears the
+  dialect registry, so whether it fails depends on test order. Not covered.
+
+Effect: every known patch selects exactly as before (sample 166.980 s, mutants 1139.8 s). Sample
+CPU is about 0.47 s.
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.
