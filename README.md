@@ -223,6 +223,7 @@ Every test the selector left out was run on the patched tree.
 | `b1`–`b5` | `TokenType` member renamed (definition only), `DataType.build` renamed (597 selected), decorator-factory body (`unsupported_args`), required keyword-only parameter added to a helper, new enum member shifting `auto()` values | 0 misses |
 | `c1`–`c5` | cache key loses its dialect component, cache disabled, `Table.__len__` wrong, `Expr.__iter__` condition, `MappingSchema(normalize=)` default | 0 misses |
 | `d1`–`d5` | new `_sql_names` on a function class (all tests), new `key` (all), new `arg_types` on a subclass that inherited it, `Dialects` enum value renamed, `_sql_names` entry removed (all) | 0 misses |
+| `e1`–`e5` | test-helper comment filter, `TPCH_SCHEMA` column type, eager dialect import in `tests/__init__.py`, docstring-only edit (doctest output) | 0 misses; `e5` full suite: nothing fails, so docstring-only edits now select nothing |
 
 ### Where the sample waste is
 
@@ -286,6 +287,7 @@ tests through the map.
 | Edit | Selection |
 |---|---|
 | comment- or blank-only | nothing |
+| docstring-only (AST equal once module, class and function docstrings are removed) | nothing: no test reads docstrings, doctests are not scored tests |
 | syntax error, deletion, rename, new import-time code, config file (`pyproject.toml`, `conftest.py`, …) | all tests |
 | function-body line no test ever executed (`dead`) | nothing |
 | data or fixture file | the tests that opened it |

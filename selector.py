@@ -358,6 +358,19 @@ def _literal(node):
     return False
 
 
+def _no_doc_dump(text):
+    """The module's AST with every module, class and function docstring removed."""
+    import ast
+
+    tree = ast.parse(text)
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            first = n.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                n.body = n.body[1:] or [ast.Pass()]
+    return ast.dump(tree)
+
+
 def import_time_effects(text):
     """(dumps of statements that run code at import, {new-assignment name: literal?}) found at
     module level or in class bodies, outside functions."""
@@ -778,6 +791,8 @@ def py_file_mask(mp, rel, f, source_old):
                 touches_comment = any("#" in c for _, ls in f["hunks"] for t, c in ls if t != " ")
                 if touches_comment and code_tokens(new_text) == code_tokens(source_old):
                     return 0  # comments / blank lines only
+                if _no_doc_dump(new_text) == _no_doc_dump(source_old):
+                    return 0  # docstrings (and layout) only: no test reads them, doctests are not scored
             except Exception:
                 pass
     removed, inserts = changed_lines(f)
