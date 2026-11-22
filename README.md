@@ -196,6 +196,7 @@ Every test the selector left out was run on the patched tree.
 | `s1`–`s7` | module-level constants: `UNESCAPED_SEQUENCES` (merged into every dialect at import), `STRICT_TIME_FORMATS`, DuckDB `_SEQ_BASE` template, `WEEK_START_DAY_TO_DOW`, `AFTER_HAVING_MODIFIER_TRANSFORMS` lambda, `helper.DATE_UNITS`, `ASCII_LOWER`/`ASCII_UPPER` swapped | 0 misses |
 | `t1`–`t10` | Snowflake `NORMALIZATION_STRATEGY`, parser `FUNCTIONS` entry, BigQuery `TYPE_MAPPING` entry, Snowflake tokenizer keyword removed, `diff.py`, `lineage.py` walk order, `schema.normalize_name` default, planner copy, JSON-path escapes, `scope.py` condition | 0 misses (`t5`: 4 selected, 1616 left out) |
 | `u1`–`u9` | new module imported by an existing one, helper signature change with some callers updated (3 files), unused function deleted, executor aggregate row order (10 selected), DuckDB typing set, test-class setup data, new public function in `sqlglot/__init__.py`, module rename + importer update (all tests) | 0 misses |
+| `v1`–`v8` | exception base class (`SchemaError(ValueError)`), verbose `__repr__`, log message text, `cached_property` on `Scope.tables`, bogus import inside `TYPE_CHECKING`, enum member order, `__slots__` entry added, tokenizer core setup copy | 0 misses |
 
 ### Where the sample waste is
 
