@@ -222,6 +222,7 @@ Every test the selector left out was run on the patched tree.
 | `y1`–`y6`, `z1`–`z2` | re-export removed from `sqlglot/__init__.py` (`Schema`, `select`), star-import order in `expressions/__init__.py`, runtime import moved under `TYPE_CHECKING`, import made lazy (93 selected), module deleted, function deleted (`simplify_parens`) or renamed (`flatten`) while other modules import it by name | **`y1`, `z1`, `z2` missed** (fixed: removed names); others 0 misses |
 | `b1`–`b5` | `TokenType` member renamed (definition only), `DataType.build` renamed (597 selected), decorator-factory body (`unsupported_args`), required keyword-only parameter added to a helper, new enum member shifting `auto()` values | 0 misses |
 | `c1`–`c5` | cache key loses its dialect component, cache disabled, `Table.__len__` wrong, `Expr.__iter__` condition, `MappingSchema(normalize=)` default | 0 misses |
+| `d1`–`d5` | new `_sql_names` on a function class (all tests), new `key` (all), new `arg_types` on a subclass that inherited it, `Dialects` enum value renamed, `_sql_names` entry removed (all) | 0 misses |
 
 ### Where the sample waste is
 
