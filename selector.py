@@ -523,7 +523,8 @@ def removes_imported_name(rel, source_old, new_text):
     module = rel[:-3].replace("/", ".")
     if module.endswith(".__init__"):
         module = module[: -len(".__init__")]
-    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(gone)) + r")\b")
+    # A file can only match _import_time_refs if it names the module or reads `.name`.
+    pat = re.compile(re.escape(module) + r"\b|\.\s*(" + "|".join(re.escape(n) for n in sorted(gone)) + r")\b")
     for top in ("sqlglot", "tests"):
         for dirpath, _, fnames in os.walk(os.path.join(SRC, top)):
             for fn in fnames:
@@ -759,13 +760,13 @@ def py_file_mask(mp, rel, f, source_old):
         try:
             new_text = apply_patch(source_old, f)
         except Exception:
-            new_text = None
+            # every real patch is against the pinned tree: not applying means we misread it
+            return import_breaking_mask(mp, rel)
         if new_text is not None:
             try:
-                # Parse only, unless a keyword that fails at compile time (not parse time) is touched.
-                touched = " ".join(c for _, ls in f["hunks"] for t, c in ls if t != " ")
-                full = any(k in touched for k in ("return", "yield", "await", "break", "continue", "nonlocal", "global"))
-                compile(new_text, rel, "exec", 0 if full else 0x400)
+                # Full compile: symtable/codegen errors (duplicate argument, misplaced __future__
+                # import, async comprehension outside async def) are not raised by ast.parse.
+                compile(new_text, rel, "exec", 0)
             except Exception:
                 return import_breaking_mask(mp, rel)  # does not even compile
             try:
@@ -937,7 +938,7 @@ def select(mp, files, extras):
     for f in files:
         rel = f["new"] if not f["deleted"] else f["old"]
         old = f["old"]
-        if rel in ALWAYS_ALL or old in ALWAYS_ALL:
+        if rel in ALWAYS_ALL or old in ALWAYS_ALL or "conftest.py" in (rel.rsplit("/", 1)[-1], old.rsplit("/", 1)[-1]):
             return mp.all_mask(), wide
         if rel.endswith(".py") and (old in mp.files or rel in mp.files):
             key = old if old in mp.files else rel
@@ -956,7 +957,10 @@ def select(mp, files, extras):
                     m |= mp.mask(mp.test_files[name])
         elif rel.endswith(".py"):
             # new python file nothing has imported yet
-            for name in ("tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py"):
+            names = ("tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py")
+            if rel.startswith("sqlglot/typing/"):  # test_typing imports every module in the package
+                names += ("tests/test_typing.py",)
+            for name in names:
                 if name in mp.test_files:
                     m |= mp.mask(mp.test_files[name])
         elif old in mp.data or rel in mp.data:

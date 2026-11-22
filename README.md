@@ -205,6 +205,24 @@ that removes a top-level name scans the source tree. If any other file imports t
 module (or star-imports the module), or reads `.name` outside a function, every test is selected.
 Effect: sample and mutants unchanged; `y1`, `y2`, `z1` and `z2` widen to all tests.
 
+### Independent review fixes
+
+A rules-and-robustness review (45 stress patches, 741 known patches, real image under the run flags)
+found no rule violations and no crashes. It did find 5 crafted kinds of edit that were missed:
+- **Errors only a full compile raises:** duplicate argument, an async comprehension in a plain
+  `def`, an import above `from __future__`. Each breaks `import sqlglot`. The selector now always
+  runs a full `compile`, not parse-only, at the same cost.
+- **`conftest.py` in any directory** now selects all tests.
+- **A new module in `sqlglot/typing/`** also selects `tests/test_typing.py`, which imports every
+  module in that package.
+- **A patch that does not apply** to the pinned file now selects all tests, instead of skipping the
+  safety checks.
+- **Speed:** the removed-name scan only parses files that name the module or read `.name`. Same
+  selections, about 3.5× faster in the worst case.
+
+Effect: every known patch (sample, mutants, all crafted and adversarial sets) selects exactly as
+before.
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.
