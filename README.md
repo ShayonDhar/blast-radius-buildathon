@@ -195,6 +195,16 @@ and `try` blocks) of a module the file did not import before selects all tests, 
 is in the standard library. `from pkg import name` counts `pkg.name` only when it is a module in the
 source tree. Effect: sample and mutants unchanged; `x1` and `u1` widen to all tests.
 
+### Removed top-level names
+
+Found by crafted edits `y1` (`Schema` re-export removed from `sqlglot/__init__.py`: 478 tests fail
+with `cannot import name`), `z1` (function `simplify_parens` deleted: 255 fail) and `z2` (`flatten`
+renamed). Another module imports the name by name, so it fails to import, and coverage of the edited
+module never shows that link. The previous selections were 1582, 132 and 132 tests. Now an edit
+that removes a top-level name scans the source tree. If any other file imports the name from that
+module (or star-imports the module), or reads `.name` outside a function, every test is selected.
+Effect: sample and mutants unchanged; `y1`, `y2`, `z1` and `z2` widen to all tests.
+
 ### Crafted new-kind batches (complement audits)
 
 Every test the selector left out was run on the patched tree.
@@ -209,6 +219,7 @@ Every test the selector left out was run on the patched tree.
 | `v1`–`v8` | exception base class (`SchemaError(ValueError)`), verbose `__repr__`, log message text, `cached_property` on `Scope.tables`, bogus import inside `TYPE_CHECKING`, enum member order, `__slots__` entry added, tokenizer core setup copy | 0 misses |
 | `w1`–`w8` | new `NULL_ORDERING` override in BigQuery, new BigQuery `TRANSFORMS` entry, `eliminate_qualify` alias prefix (1 selected), `qualify(expand_alias_refs=)` default, `time.format_time`, test helper `validate_all`, `staticmethod` → `classmethod` in the executor (10 selected), new module global `schema` | 0 misses |
 | `x1`–`x6` | eager dialect import added at the end of `generator.py`, base typing table entry, CLI help text, new docs file (0 selected; all 1620 pass), DuckDB typing table | **`x1` missed** (fixed: new imports); others 0 misses |
+| `y1`–`y6`, `z1`–`z2` | re-export removed from `sqlglot/__init__.py` (`Schema`, `select`), star-import order in `expressions/__init__.py`, runtime import moved under `TYPE_CHECKING`, import made lazy (93 selected), module deleted, function deleted (`simplify_parens`) or renamed (`flatten`) while other modules import it by name | **`y1`, `z1`, `z2` missed** (fixed: removed names); others 0 misses |
 
 ### Where the sample waste is
 

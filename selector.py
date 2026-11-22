@@ -446,6 +446,89 @@ def adds_new_import(source_old, new_text, rel=""):
     return False
 
 
+def _top_names(text):
+    """Names bound at module level (defs, classes, assignments, imports), outside functions."""
+    import ast
+
+    out = set()
+
+    def walk(body):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(st.name)
+            elif isinstance(st, (ast.Import, ast.ImportFrom)):
+                for a in st.names:
+                    out.add((a.asname or a.name).split(".", 1)[0])
+            elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                for tg in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                    for n in ast.walk(tg):
+                        if isinstance(n, ast.Name):
+                            out.add(n.id)
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(st, field, None)
+                if isinstance(sub, list) and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    walk(sub)
+            for h in getattr(st, "handlers", None) or ():
+                walk(h.body)
+
+    walk(ast.parse(text).body)
+    return out
+
+
+def _import_time_refs(text, names, module):
+    """True when `text` imports one of `names` from `module`, star-imports `module`, or reads
+    `.name` for one of them outside function bodies (code that runs while the file is imported)."""
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return True
+    funcs = [(n.lineno, n.end_lineno) for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == module:
+            if any(a.name == "*" or a.name in names for a in n.names):
+                return True
+        elif isinstance(n, ast.Attribute) and n.attr in names:
+            ln = n.lineno
+            if not any(a < ln <= b for a, b in funcs):
+                return True
+    return False
+
+
+def removes_imported_name(rel, source_old, new_text):
+    """An edit that stops a module from defining a top-level name another module imports by name
+    (`from mod import name`) or reads while it is imported (`exp.Name` in a class body) makes that
+    importer fail to import; coverage of the module itself never shows it."""
+    if not rel.endswith(".py"):
+        return False
+    import re
+
+    gone = _top_names(source_old) - _top_names(new_text)
+    if not gone:
+        return False
+    module = rel[:-3].replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(gone)) + r")\b")
+    for top in ("sqlglot", "tests"):
+        for dirpath, _, fnames in os.walk(os.path.join(SRC, top)):
+            for fn in fnames:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                if os.path.relpath(path, SRC) == rel:
+                    continue
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                if pat.search(text) and _import_time_refs(text, gone, module):
+                    return True
+    return False
+
+
 def adds_import_time_code(source_old, new_text, rel=""):
     old_flags, old_assigned = import_time_effects(source_old)
     new_flags, new_assigned = import_time_effects(new_text)
@@ -678,6 +761,8 @@ def py_file_mask(mp, rel, f, source_old):
                     not (mp.in_function(rel, max(a, 1)) and mp.in_function(rel, max(b, 1))) for a, b in inserts0)
                 if outside and adds_import_time_code(source_old, new_text, rel):
                     return import_breaking_mask(mp, rel)  # new code that runs when the module is imported
+                if removes_imported_name(rel, source_old, new_text):
+                    return import_breaking_mask(mp, rel)  # an importer of a removed name fails to import
             except SyntaxError:
                 return import_breaking_mask(mp, rel)
             except Exception:
